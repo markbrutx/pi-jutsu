@@ -14,7 +14,10 @@ Techniques for the pi coding agent.
 | [simplify](extensions/simplify/) | Three parallel review subagents over your changed code: reuse, quality, and efficiency. |
 
 ![Clone dashboard](docs/dashboard.png)
-<!-- TODO: drop a screenshot of the swarm clone dashboard at docs/dashboard.png -->
+
+The swarm dashboard, mid-flight: four shadow clones porting this very repository into the open. The tray keeps clone status visible while you keep chatting:
+
+![Agents tray](docs/tray.png)
 
 ## Install
 

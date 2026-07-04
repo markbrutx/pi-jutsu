@@ -52,7 +52,11 @@ Clones themselves get the coding toolset plus:
   opens the dashboard.
 
 While agents are live, a status line above the editor shows each clone's
-state (or aggregate counts) and active worker runs. The dashboard is a
+state (or aggregate counts) and active worker runs:
+
+![Agents tray](../../docs/tray.png)
+
+![Clone dashboard](../../docs/dashboard.png) The dashboard is a
 two-pane master/detail view: agents on the left, the selected agent's full
 transcript (tool calls, thinking, messages) on the right, with scrolling,
 steering input (`Enter`), abort (`a`), dispel (`d`), and thinking toggle
