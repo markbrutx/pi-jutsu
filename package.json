@@ -1,0 +1,25 @@
+{
+	"name": "pi-jutsu",
+	"private": true,
+	"type": "module",
+	"description": "Curated extensions for the pi coding agent",
+	"keywords": [
+		"pi-extension",
+		"pi-package",
+		"agents",
+		"subagents"
+	],
+	"author": "Magzhan Nurlybek (https://github.com/markbrutx)",
+	"license": "MIT",
+	"scripts": {
+		"check": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.80.3",
+		"@earendil-works/pi-coding-agent": "0.80.3",
+		"@earendil-works/pi-tui": "0.80.3",
+		"@types/node": "26.1.0",
+		"typebox": "1.3.3",
+		"typescript": "6.0.3"
+	}
+}
