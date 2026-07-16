@@ -39,14 +39,14 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 // on its own. Multi-session-safe: any activity from any live session resets the
 // timer, so a shared daemon only dies when ALL of them are gone. Override via env.
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
-const PROFILES_DIR = path.join(homedir(), ".pi", "browser-profiles");
+const PROFILES_DIR = process.env.PI_BROWSER_PROFILES_DIR || path.join(homedir(), ".pi", "browser-profiles");
 const DEFAULT_PROFILE = process.env.PI_BROWSER_PROFILE || "work";
+const SESSION_PREFIX = process.env.PI_BROWSER_SESSION_PREFIX?.replaceAll(/[^A-Za-z0-9._-]/g, "-") || undefined;
 const STEALTH_ENABLED = !["0", "false", "no"].includes((process.env.PI_BROWSER_STEALTH ?? "").toLowerCase());
+const PROTECTED_BROWSER_FLAGS = ["--executable-path", "--profile", "--session", "--session-name"];
 
 // Cached once per process. `null` = looked, not found; `undefined` = not looked yet.
 let cachedStealthBinary: string | null | undefined;
-// Tracks the profile the live daemon was launched with, so a switch can restart it.
-let activeProfile: string | null = null;
 
 export default function browserExtension(harness: ExtensionAPI) {
 	const bin = process.env.BROWSER_CLI_BIN ?? DEFAULT_BIN;
@@ -71,11 +71,11 @@ export default function browserExtension(harness: ExtensionAPI) {
 		name: "browser",
 		label: "Browser",
 		description: [
-			"Drive a stealth Chrome browser via the agent-browser CLI.",
+			"Drive a Chrome browser via the agent-browser CLI.",
 			"Pass raw CLI arguments as `args` (without the binary name).",
 			"",
-			"Stealth Chromium and a persistent profile are wired in automatically:",
-			"cookies, logins and history survive across calls and sessions. Default",
+			"Stealth Chromium is used automatically when detected. A persistent profile",
+			"keeps cookies, logins and history across calls and sessions. Default",
 			`profile is "${DEFAULT_PROFILE}"; pass \`profile\` to use a different one.`,
 			"",
 			'First call MUST be: args = ["skills", "get", "core"]',
@@ -100,11 +100,11 @@ export default function browserExtension(harness: ExtensionAPI) {
 			'  ["network", "requests", "--filter", "api/"]   // recent requests/responses',
 		].join("\n"),
 		promptSnippet:
-			"Drive a stealth Chrome browser with persistent profiles (open URLs, click, fill forms, screenshot, eval JS).",
+			"Drive a Chrome browser with isolated persistent profiles (open URLs, click, fill forms, screenshot, eval JS).",
 		promptGuidelines: [
 			'Before using browser for the first time in a session, call browser with args=["skills","get","core"] and follow the snapshot+ref workflow it describes.',
 			'Always re-run ["snapshot","-i"] after any action that changes the page; old @eN refs become stale.',
-			"Stealth Chromium and the persistent profile are automatic. Do not pass --executable-path or --profile yourself; use the `profile` param to switch profiles.",
+			"Stealth Chromium is used when detected, and persistent profiles are automatic. Do not pass --executable-path, --profile, or --session; use the `profile` param to switch profiles.",
 			'Never poll a page with sleep+eval loops: use ["wait", ...] (selector, --text, --url, --fn, --load networkidle) and ["network", "requests", "--filter", ...] — they block without burning turns.',
 		],
 		parameters: Type.Object({
@@ -114,7 +114,7 @@ export default function browserExtension(harness: ExtensionAPI) {
 			}),
 			profile: Type.Optional(
 				Type.String({
-					description: `Persistent profile name (user-data-dir under ~/.pi/browser-profiles). Default "${DEFAULT_PROFILE}".`,
+					description: `Persistent profile name (user-data-dir under ${PROFILES_DIR}). Default "${DEFAULT_PROFILE}".`,
 				}),
 			),
 			timeoutMs: Type.Optional(
@@ -136,19 +136,64 @@ export default function browserExtension(harness: ExtensionAPI) {
 				};
 			}
 
+			const protectedArg = args.find((arg) =>
+				PROTECTED_BROWSER_FLAGS.some((flag) => arg === flag || arg.startsWith(`${flag}=`)),
+			);
+			if (protectedArg) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `error: ${protectedArg} is managed by the browser tool; use the profile parameter instead.`,
+						},
+					],
+					details: { isError: true },
+					isError: true,
+				};
+			}
+
 			const profile = params.profile ?? DEFAULT_PROFILE;
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profile)) {
+				return {
+					content: [{ type: "text", text: "error: profile must be a simple 1-64 character name." }],
+					details: { isError: true },
+					isError: true,
+				};
+			}
+
 			const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 			// connect/--cdp attach to an external Chrome; profile + executable must not be set.
 			const usesCdp = args.includes("--cdp") || args[0] === "connect";
 
-			// Switching profiles requires restarting the daemon, otherwise the new
-			// profile is silently ignored ("daemon already running").
-			if (!usesCdp && activeProfile !== null && activeProfile !== profile) {
-				await runCli(bin, ["close", "--all"], { timeoutMs: 15_000, env: process.env });
+			// `close --all` closes every session's daemon in the socket dir, including
+			// daemons belonging to other pi sessions and the user's own agents.
+			if (["close", "quit", "exit"].includes(args[0]) && args.includes("--all")) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: 'error: close --all would kill other sessions\' browser daemons; use ["close"] to close this session only.',
+						},
+					],
+					details: { isError: true },
+					isError: true,
+				};
 			}
 
-			const env = usesCdp ? process.env : buildEnv(profile);
-			if (!usesCdp) activeProfile = profile;
+			// The daemon applies AGENT_BROWSER_PROFILE per command, relaunching the
+			// browser itself when the profile differs from the running one, so no
+			// restart bookkeeping is needed here.
+			let env: NodeJS.ProcessEnv;
+			try {
+				env = usesCdp ? process.env : buildEnv(profile);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text", text: `error: cannot create profile dir: ${message}` }],
+					details: { isError: true },
+					isError: true,
+				};
+			}
 
 			const cmdLine = `${bin} ${args.map(quoteArg).join(" ")}`;
 			onUpdate?.({ content: [{ type: "text", text: `$ ${cmdLine}` }], details: undefined });
@@ -166,8 +211,9 @@ export default function browserExtension(harness: ExtensionAPI) {
 					stdout: result.stdout,
 					stderr: result.stderr,
 					timedOut: result.timedOut,
+					aborted: result.aborted,
 				},
-				isError: result.code !== 0 || result.timedOut,
+				isError: result.code !== 0 || result.timedOut || result.aborted,
 			};
 		},
 	});
@@ -180,6 +226,7 @@ function buildEnv(profile: string): NodeJS.ProcessEnv {
 	const profileDir = path.join(PROFILES_DIR, profile);
 	mkdirSync(profileDir, { recursive: true });
 	env.AGENT_BROWSER_PROFILE = profileDir;
+	if (SESSION_PREFIX) env.AGENT_BROWSER_SESSION = `${SESSION_PREFIX}-${profile}`;
 
 	if (STEALTH_ENABLED) {
 		const binary = findStealthBinary();
@@ -245,6 +292,7 @@ interface CliResult {
 	stderr: string;
 	code: number;
 	timedOut: boolean;
+	aborted: boolean;
 }
 
 interface RunOptions {
@@ -263,14 +311,17 @@ function runCli(bin: string, args: string[], opts: RunOptions): Promise<CliResul
 		let stdout = "";
 		let stderr = "";
 		let timedOut = false;
+		let aborted = false;
 		let settled = false;
+		let killTimer: NodeJS.Timeout | undefined;
 
 		const finish = (code: number) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			clearTimeout(killTimer);
 			opts.signal?.removeEventListener("abort", onAbort);
-			resolve({ stdout, stderr, code, timedOut });
+			resolve({ stdout, stderr, code, timedOut, aborted });
 		};
 
 		child.stdout.on("data", (c) => {
@@ -288,12 +339,13 @@ function runCli(bin: string, args: string[], opts: RunOptions): Promise<CliResul
 		const timer = setTimeout(() => {
 			timedOut = true;
 			child.kill("SIGTERM");
-			setTimeout(() => child.kill("SIGKILL"), 2000);
+			killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
 		}, opts.timeoutMs);
 
 		const onAbort = () => {
+			aborted = true;
 			child.kill("SIGTERM");
-			setTimeout(() => child.kill("SIGKILL"), 2000);
+			killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
 		};
 		if (opts.signal) {
 			if (opts.signal.aborted) onAbort();
@@ -307,7 +359,8 @@ function formatResult(cmd: string, r: CliResult): string {
 	if (r.stdout.trim()) parts.push(r.stdout.trimEnd());
 	if (r.stderr.trim()) parts.push(`[stderr]\n${r.stderr.trimEnd()}`);
 	if (r.timedOut) parts.push("[timed out]");
-	if (r.code !== 0 && !r.timedOut) parts.push(`[exit code ${r.code}]`);
+	if (r.aborted) parts.push("[aborted]");
+	if (r.code !== 0 && !r.timedOut && !r.aborted) parts.push(`[exit code ${r.code}]`);
 	if (parts.length === 1) parts.push("(no output)");
 	return parts.join("\n");
 }

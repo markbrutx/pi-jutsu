@@ -1,16 +1,25 @@
 # simplify
 
-A pi extension that runs a changed-code review with three parallel subagents,
-then guides the agent through fixing what they find.
+A pi extension that runs a changed-code review with a configurable council of
+parallel subagents, then guides the agent through fixing what they find.
 
-## Command
+## Commands
 
 ```
 /simplify [optional focus text]
+/simplify-council
 ```
 
 Anything after `/simplify` is passed through as additional focus for the
 reviewers (e.g. `/simplify pay extra attention to error handling`).
+
+On the first `/simplify` without saved preferences, a fullscreen picker
+(alt-screen, like the agents dashboard) asks which model each review role
+runs on; the choice is saved to `~/.pi/agent/simplify-settings.json` and
+skipped afterwards. `/simplify-council` reopens the picker (preserving any
+custom member ids, aspects, and instructions — it only reassigns models).
+The picker has an idle timeout: walk away and the review proceeds with the
+current defaults instead of blocking.
 
 ## How it works
 
@@ -34,9 +43,10 @@ The tool determines what changed using git:
 
 ### Phase 2: parallel subagent review
 
-Three isolated review subagents run concurrently, each seeing the same change
-set and focus text but scoped to read-only tools (`read`, `grep`, `find`,
-`ls`, `bash`). None of them can modify files.
+The configured council of isolated review subagents runs concurrently, each
+seeing the same change set and focus text but scoped to read-only tools
+(`read`, `grep`, `find`, `ls`, `bash`). None of them can modify files. The
+default council is three role reviewers, each optionally on its own model:
 
 - **Code Reuse** - looks for existing utilities/helpers that duplicate or
   could replace newly written code, and inline logic that should call an
@@ -49,9 +59,31 @@ set and focus text but scoped to read-only tools (`read`, `grep`, `find`,
   checks, memory issues, and overly broad reads/loads.
 
 Progress streams live in the UI: each subagent's status (pending/running/
-done/failed), last activity, tool calls, and thinking are shown collapsed by
-default, with full output and findings visible when the tool call is
-expanded.
+done/failed), last activity, model/account attribution, tool calls, and
+thinking are shown collapsed by default, with full output and findings
+visible when the tool call is expanded. Runs are also published to the
+swarm worker-run registry, so the council shows up in the swarm agents
+dashboard while it reviews.
+
+## Configuration
+
+`~/.pi/agent/simplify-settings.json`:
+
+```json
+{
+  "council": [
+    { "id": "reuse", "aspect": "reuse", "model": "anthropic/claude-fable-5" },
+    { "id": "quality", "aspect": "quality" },
+    { "id": "deep", "instruction": "Custom review brief...", "model": "provider/model-id" }
+  ]
+}
+```
+
+Member fields: `id` (display name), `aspect` (`reuse` | `quality` |
+`efficiency` | `full`; default `full`), `instruction` (custom review brief,
+overrides aspect), `model` (exact `provider/model-id` from `--list-models`;
+omit to run on the lead's model). Missing or invalid config = the classic
+reuse/quality/efficiency trio on the lead's model.
 
 ### Phase 3: fix findings
 
@@ -86,5 +118,8 @@ or by adding it to the `extensions` array in your pi settings:
 - Runs inside a git repository (or a working tree with a `.git` directory);
   outside of one, it falls back to reviewing recently touched files from the
   session.
+- Requires the sibling [swarm](../swarm/) extension directory to be present
+  in the same checkout (simplify imports its worker-run registry and shared
+  helpers via relative paths; you do not have to enable swarm in settings).
 - Requires `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` as
   provided by the pi harness.

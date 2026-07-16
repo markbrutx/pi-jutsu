@@ -23,11 +23,19 @@ Registered on the lead agent (gated by settings):
 
 | Tool | Purpose |
 | --- | --- |
-| `shadowclone_summon` | Summon 1-8 clones in one call. Per clone: task, optional name, `keep` (stay alive for follow-ups), persona, git worktree, model. Returns immediately. |
+| `shadowclone_summon` | Summon 1-8 clones in one call. Per clone: task, optional name, `keep` (stay alive for follow-ups), persona, git worktree, model, `account` (saved /acc auth profile). Returns immediately. |
 | `shadowclone_send` | Send instructions/answers to a live clone. Busy clones get a steering interrupt; idle ones start working; paused ones revive. |
 | `shadowclone_status` | Status, last activity, touched files, and recent actions of live clones (also lists clones of other pi sessions on the machine). |
 | `shadowclone_dispel` | Dispel a clone (or `all`), aborting in-progress work and returning its memories. |
+| `shadowclone_pause` | Temporarily pause a clone (or `all`): in-flight work is aborted, the session and context stay intact and cost nothing while paused. |
+| `shadowclone_account` | Switch a live clone to another saved /acc auth profile — per clone: the lead and sibling clones keep their own accounts. Auto-resumes a paused clone. |
 | `worker_run` | Run 1-10 independent subtasks in parallel as one-shot workers. Optional tool restriction and per-run model. |
+
+Per-clone auth is isolated: each clone gets its own credential view over the
+lead's auth storage, so `/acc` switches on the lead never drift a running
+clone, and OAuth token rotations flow back through the /acc catalog. On a
+429/rate-limit error a clone auto-pauses on the first hit (no retry, no
+fallback model) with its session intact — switch its account or resume later.
 
 Clones themselves get the coding toolset plus:
 
@@ -47,7 +55,8 @@ Clones themselves get the coding toolset plus:
 - `/shadowclones` — open the clone dashboard.
 - `/shadowclone-pop <name>` — debug: crash a working clone to test the
   failure-pause path.
-- `alt+k` (⌥K on macOS) — open the dashboard from anywhere.
+- `alt+k` (⌥K on macOS) — open the dashboard from anywhere. In the
+  dashboard: `p` pauses a running clone or resumes a paused one.
 - `Down` from an empty editor — focus the agents tray; `Down`/`Enter` again
   opens the dashboard.
 

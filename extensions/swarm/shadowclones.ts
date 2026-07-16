@@ -1,17 +1,21 @@
 import {
 	createAgentSession,
+	formatSize,
 	getAgentDir,
 	getMarkdownTheme,
 	isToolCallEventType,
 	SessionManager,
+	truncateHead,
+	truncateTail,
 	type AgentSession,
+	type AuthStorage,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ResourceLoader,
 	type Theme,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { isPolicyBlockedError, StringEnum } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import { Input, Key, Markdown, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
@@ -21,22 +25,32 @@ import { appendFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
+	createCloneAuthStorage,
+	createCloneModelRegistry,
 	createSubagentLoader,
 	createThrottledEmitter,
 	formatDisplayItem,
+	formatModelSpec,
+	getAccountCredential,
 	getEventUpdate,
+	getModelTransition,
 	getToolPathArg,
+	isRateLimitedError,
+	listAccountProfiles,
+	pinCloneAccount,
 	readSwarmSettings,
+	resolveAccountLabel,
 	resolveSpawnModel,
-	resolveTierModel,
-	STOP_REASON_ABORTED,
+	resolveSpawnThinkingLevel,
+	SPAWN_THINKING_LEVELS,
 	STOP_REASON_ERROR,
 	truncateSingleLine,
 	type SwarmDisplayItem,
 } from "./shared.ts";
-import { createSwarmTool, type SwarmDetails, type SwarmStatus } from "./index.ts";
+import { createSwarmTool, type SwarmAgentProgress, type SwarmDetails, type SwarmStatus } from "./index.ts";
 import {
 	clearWorkerRuns,
+	dispelWorkerRun,
 	listWorkerRuns,
 	onWorkerRunsChange,
 	type WorkerRunRecord,
@@ -50,7 +64,7 @@ export function cloneToolNames(cloneWorkers: boolean): string[] {
 }
 const MAX_CLONES = 8;
 // 24 = three full lead sessions at the per-session cap (3 x 8), so several leads
-// (e.g. parallel batch runs) can each run a full clone batch concurrently.
+// (e.g. parallel pSEO waves) can each run a full clone batch concurrently.
 const GLOBAL_MAX_CLONES = 24;
 const WIDGET_THROTTLE_MS = 150;
 const SHADOWCLONE_REPORT_TYPE = "shadowclone-report";
@@ -59,6 +73,9 @@ const ITEMS_MAX = 30;
 const MEMORY_MIN_TRANSCRIPT_ENTRIES = 6;
 const MEMORY_TRANSCRIPT_MAX_CHARS = 40_000;
 const MEMORY_DISTILL_TIMEOUT_MS = 30_000;
+const CLONE_REPORT_MAX_BYTES = 20 * 1024;
+const CLONE_REPORT_BATCH_MAX_BYTES = 48 * 1024;
+export const CLONE_ABORT_GRACE_MS = 2_000;
 const LINGER_MINUTES = 5;
 const LINGER_MS = LINGER_MINUTES * 60_000;
 const WAIT_TIMEOUT_DEFAULT_S = 300;
@@ -66,15 +83,47 @@ const WAIT_TIMEOUT_MAX_S = 1800;
 const WAIT_COMMAND_TIMEOUT_MS = 30_000;
 const SLEEP_GUARD_MIN_S = 10;
 
+export function truncateCloneReport(output: string, maxBytes: number = CLONE_REPORT_MAX_BYTES): string {
+	const normalized = output.trim() || "(no report returned)";
+	const budget = Math.max(0, Math.floor(maxBytes));
+	const totalBytes = Buffer.byteLength(normalized, "utf8");
+	if (totalBytes <= budget) return normalized;
+	if (budget === 0) return "";
+
+	const marker = `[Clone report truncated from ${formatSize(totalBytes)} to protect the lead context. The full report is preserved in the clone log.]`;
+	const markerBytes = Buffer.byteLength(`\n\n${marker}\n\n`, "utf8");
+	if (markerBytes >= budget) return truncateTail(marker, { maxBytes: budget, maxLines: 1 }).content;
+	const contentBudget = budget - markerBytes;
+	const headBudget = Math.max(1, Math.floor(contentBudget / 2));
+	const tailBudget = Math.max(1, contentBudget - headBudget);
+	const head = truncateHead(normalized, { maxBytes: headBudget, maxLines: 1000 }).content;
+	const tail = truncateTail(normalized, { maxBytes: tailBudget, maxLines: 1000 }).content;
+	return [head, marker, tail].filter(Boolean).join("\n\n");
+}
+
+export function truncateCloneReportBatch(
+	reports: readonly string[],
+	maxBytes: number = CLONE_REPORT_BATCH_MAX_BYTES,
+): string {
+	if (reports.length === 0) return "";
+	if (reports.length === 1) return truncateCloneReport(reports[0], Math.min(maxBytes, CLONE_REPORT_MAX_BYTES));
+	const prefix = `${reports.length} shadow clone reports:\n\n`;
+	const separator = "\n\n———\n\n";
+	const overhead = Buffer.byteLength(prefix, "utf8") + Buffer.byteLength(separator, "utf8") * (reports.length - 1);
+	const perReportBudget = Math.max(1, Math.floor((Math.max(0, maxBytes) - overhead) / reports.length));
+	return `${prefix}${reports.map((report) => truncateCloneReport(report, perReportBudget)).join(separator)}`;
+}
+
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 /** OS-native label for the dashboard hotkey: ⌥K on macOS, alt+k elsewhere. */
 const HOTKEY_LABEL = process.platform === "darwin" ? "⌥K" : "alt+k";
 
-/** One icon language everywhere: spinner = working, ? = waiting for an answer, green dot = ready, red cross = failed. */
+/** One icon language everywhere: spinner = working, ? = waiting, ⏸ = paused, green check = ready, red cross = failed. */
 function statusIcon(theme: Theme, status: CloneStatus, spinnerGlyph: string): string {
 	if (status === "working") return theme.fg("warning", spinnerGlyph);
 	if (status === "waiting") return theme.fg("warning", "?");
+	if (status === "paused") return theme.fg("warning", "⏸");
 	if (status === "idle") return theme.fg("success", "✔");
 	return theme.fg("error", "✗");
 }
@@ -82,8 +131,9 @@ function statusIcon(theme: Theme, status: CloneStatus, spinnerGlyph: string): st
 function statusWord(theme: Theme, status: CloneStatus): string {
 	if (status === "working") return theme.fg("dim", "working");
 	if (status === "waiting") return theme.fg("warning", "waiting");
+	if (status === "paused") return theme.fg("warning", "paused");
 	if (status === "idle") return theme.fg("success", "ready");
-	return theme.fg("error", "paused");
+	return theme.fg("error", "failed");
 }
 
 /** Worker-run phase glyph: spinner while active, green dot done, red cross failed. */
@@ -91,6 +141,25 @@ function workerPhaseIcon(theme: Theme, phase: string, spinnerGlyph: string): str
 	if (phase === "failed") return theme.fg("error", "✗");
 	if (phase === "done") return theme.fg("success", "✔");
 	return theme.fg("warning", spinnerGlyph);
+}
+
+/** Per-agent status bits shared by sidebar worker rows and the worker panes. */
+function agentStatusBits(status: SwarmStatus): {
+	icon: string;
+	word: string;
+	tone: "success" | "error" | "warning" | "muted";
+} {
+	if (status === "done") return { icon: "✔", word: "done", tone: "success" };
+	if (status === "failed") return { icon: "✗", word: "failed", tone: "error" };
+	if (status === "running") return { icon: "▸", word: "running", tone: "warning" };
+	return { icon: "○", word: "queued", tone: "muted" };
+}
+
+/** Sidebar/pane icon for one worker agent: live spinner while running, static glyphs otherwise. */
+function agentStatusIcon(theme: Theme, status: SwarmStatus, spinnerGlyph: string): string {
+	if (status === "running") return theme.fg("warning", spinnerGlyph);
+	const { icon, tone } = agentStatusBits(status);
+	return theme.fg(tone, icon);
 }
 
 /** Settled (done|failed) and total agent counts for a worker run. */
@@ -135,26 +204,95 @@ function statusTone(text: string): "error" | "success" | "warning" | "muted" {
 }
 
 const NAME_POOL = [
-	"itachi",
-	"kakashi",
-	"shikamaru",
+	// Team 7 + senseis
+	"naruto",
 	"sasuke",
 	"sakura",
-	"hinata",
-	"gaara",
-	"jiraiya",
+	"kakashi",
+	"sai",
+	"yamato",
+	// Uchiha
+	"itachi",
+	"shisui",
+	"obito",
+	"madara",
+	// Hokage & founders
+	"minato",
+	"kushina",
+	"hashirama",
+	"tobirama",
+	"hiruzen",
 	"tsunade",
-	"neji",
-	"rock-lee",
-	"kiba",
-	"shino",
+	"danzo",
+	// Sannin & co
+	"jiraiya",
+	"orochimaru",
+	"kabuto",
+	"shizune",
+	// Konoha 11 + senseis
+	"shikamaru",
 	"ino",
 	"choji",
-	"temari",
-	"minato",
-	"obito",
-	"yamato",
+	"asuma",
+	"hinata",
+	"neji",
+	"hanabi",
+	"kiba",
+	"shino",
+	"kurenai",
+	"rock-lee",
+	"tenten",
+	"gai",
 	"konohamaru",
+	"iruka",
+	"anko",
+	"ibiki",
+	"genma",
+	"rin",
+	// Suna
+	"gaara",
+	"temari",
+	"kankuro",
+	"chiyo",
+	// Akatsuki
+	"pain",
+	"nagato",
+	"konan",
+	"yahiko",
+	"kisame",
+	"deidara",
+	"sasori",
+	"hidan",
+	"kakuzu",
+	"zetsu",
+	// Kiri & rogue
+	"zabuza",
+	"haku",
+	"kimimaro",
+	"suigetsu",
+	"karin",
+	"jugo",
+	"mei",
+	"chojuro",
+	"yagura",
+	"utakata",
+	// Kumo / Iwa / jinchuriki & kage
+	"killer-bee",
+	"raikage",
+	"darui",
+	"omoi",
+	"karui",
+	"yugito",
+	"onoki",
+	"kurotsuchi",
+	"roshi",
+	"han",
+	"fu",
+	// Legends & misc
+	"mifune",
+	"hanzo",
+	"kurama",
+	"gamabunta",
 ] as const;
 
 const NAME_SYLLABLES = [
@@ -183,7 +321,7 @@ function composeRow(left: string, right: string, width: number): string {
 }
 
 function generateNarutoName(): string {
-	const count = 2 + Math.floor(Math.random() * 2);
+	const count = 2 + Math.floor(Math.random() * 3);
 	let name = "";
 	for (let i = 0; i < count; i++) {
 		name += NAME_SYLLABLES[Math.floor(Math.random() * NAME_SYLLABLES.length)];
@@ -194,20 +332,15 @@ function generateNarutoName(): string {
 const CLONE_SWARM_GUIDANCE_LINE = `
 - You MAY call worker_run to fan independent sub-parts of YOUR task out to parallel one-shot worker subagents (e.g. one task per locale/file), so each runs in a fresh, focused context instead of bloating yours. Rules: each worker task must touch DISJOINT files and be self-contained; pass a \`focus\` telling them which dir to write. Workers cannot run workers or summon, so the tree stops at them. You CANNOT summon clones (no shadowclone tools). Use worker_run when your task splits cleanly into independent chunks; do it yourself in one context when it does not.`;
 
-function cloneTierGuidanceLine(workerModelSpec: string): string {
-	return `
-- Model tiers are active: you run on the architect model; your worker_run workers run on a cheaper executor model (${workerModelSpec}). Do the thinking, decomposition, and review yourself, and hand workers mechanical, well-framed edits with explicit file paths, tight scope, and concrete acceptance criteria. Prefer delegating bulk edits to workers over grinding through them yourself; verify their output before reporting.`;
-}
-
 /** Clones get the worker_run bullet only when cloneWorkers is enabled; otherwise the tool isn't present. */
-export function buildCloneSystemPrompt(cloneWorkers: boolean, tierWorkerModel?: string): string {
+export function buildCloneSystemPrompt(cloneWorkers: boolean): string {
 	return `You are a shadow clone subagent summoned by a lead agent.
 
 - All tasks concern the user's own repository and product, and the work is fully authorized. Tasks about access control, paywalls, redaction, or security hardening are about the user's OWN product, not third-party systems.
 - Stay strictly within your task scope. Sibling clones may work in parallel; do not touch their files.
 - If the task is ambiguous in a way that materially affects the result (taste, scope, missing facts), ask the lead FIRST via report_to_lead with kind "question", then stop and wait for the answer. Batch your questions; ask once, not per detail. Do not ask about trivia you can decide yourself.
 - Use report_to_lead with kind "update" for important interim findings or blockers; keep working after an update.
-- New instructions from the lead may arrive at any time. Always follow the latest.${cloneWorkers ? CLONE_SWARM_GUIDANCE_LINE : ""}${cloneWorkers && tierWorkerModel ? cloneTierGuidanceLine(tierWorkerModel) : ""}
+- New instructions from the lead may arrive at any time. Always follow the latest.${cloneWorkers ? CLONE_SWARM_GUIDANCE_LINE : ""}
 - Never poll with bash sleep loops. Use the wait_for tool to block until a file or command condition holds; for web pages use \`agent-browser wait\` (selector, --text, --url, --fn, --load networkidle) and \`agent-browser network requests --filter\` via bash. Blocking waits are free; sleep-polling burns money and context. A message from the lead interrupts an in-progress wait_for: handle the new instructions first, then re-establish the wait if still relevant.
 - Your final response after each instruction is delivered to the lead automatically as your report: what you did, files touched, anything to verify. Do not use report_to_lead for the final report. End it with a "Deliverables:" section listing every file you created or modified with a one-line purpose, plus anything the lead must verify before committing.`;
 }
@@ -237,13 +370,24 @@ const SummonCloneSchema = Type.Object({
 	worktree: Type.Optional(
 		Type.String({
 			description:
-				"Branch name of an EXISTING git worktree to run this clone in. Omit to use your active worktree, else the repo root. Create worktrees first with `git worktree add`.",
+				"Branch name of an EXISTING git worktree (pi-dev-worktrees / git worktree) to run this clone in. Omit to use your active worktree, else the repo root. Create worktrees first with /worktree <branch>.",
 		}),
 	),
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Model for this clone: "provider/model-id" or tier alias "architect"/"executor" (e.g. executor for a long mechanical task). Omit for the default; unknown or unauthenticated specs silently fall back to it.',
+				'Model for this clone: an exact "provider/model-id" from --list-models. Omit to inherit the lead\'s model.',
+		}),
+	),
+	thinking: Type.Optional(
+		StringEnum(SPAWN_THINKING_LEVELS, {
+			description: "Thinking level for this clone. Omit for the default, medium.",
+		}),
+	),
+	account: Type.Optional(
+		Type.String({
+			description:
+				"Saved /acc auth profile to run this clone under (applies to its model's provider). Omit to inherit the lead's account.",
 		}),
 	),
 });
@@ -271,6 +415,17 @@ const DispelParamsSchema = Type.Object({
 	name: Type.String({ description: 'Clone nickname, or "all" to dispel every live clone.' }),
 });
 
+const PauseParamsSchema = Type.Object({
+	name: Type.String({ description: 'Clone nickname, or "all" to pause every running clone.' }),
+});
+
+const AccountParamsSchema = Type.Object({
+	name: Type.String({ description: "Clone nickname, with or without leading @." }),
+	account: Type.String({
+		description: "Saved /acc auth profile to switch this clone to (for its current model's provider).",
+	}),
+});
+
 const ReportParamsSchema = Type.Object({
 	kind: StringEnum(["question", "update"] as const, {
 		description:
@@ -283,6 +438,8 @@ type SummonParams = Static<typeof SummonParamsSchema>;
 type SendParams = Static<typeof SendParamsSchema>;
 type StatusParams = Static<typeof StatusParamsSchema>;
 type DispelParams = Static<typeof DispelParamsSchema>;
+type PauseParams = Static<typeof PauseParamsSchema>;
+type AccountParams = Static<typeof AccountParamsSchema>;
 
 interface CloneSpec {
 	name: string;
@@ -293,19 +450,29 @@ interface CloneSpec {
 	cwd: string;
 	/** Branch label of the clone's worktree, shown in the dashboard. */
 	worktreeLabel?: string;
-	/** Explicit model request from the summon call ("provider/model-id" or tier alias). */
-	model?: string;
+	/** Resolved explicit model override; undefined inherits the lead's model. */
+	model?: ExtensionContext["model"];
+	/** Effective thinking level selected for this clone. */
+	thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>;
+	/** Saved /acc profile to pin as this clone's account; undefined inherits the lead's. */
+	account?: string;
 }
 
-interface SummonInfo extends CloneSpec {
+interface SummonInfo extends Omit<CloneSpec, "model" | "thinkingLevel"> {
 	logPath: string;
+	/** Resolved "provider/model-id" this clone actually runs on. */
+	modelSpec?: string;
+	/** Effective thinking level this clone runs with. */
+	thinking: ReturnType<ExtensionAPI["getThinkingLevel"]>;
+	/** /acc account profile the clone's provider auth resolved to at summon. */
+	account?: string;
 }
 
 interface SummonDetails {
 	summons: SummonInfo[];
 }
 
-type CloneStatus = "working" | "waiting" | "idle" | "failed";
+type CloneStatus = "working" | "waiting" | "idle" | "paused" | "failed";
 
 interface ShadowClone {
 	name: string;
@@ -323,7 +490,14 @@ interface ShadowClone {
 	transcript: TranscriptEntry[];
 	transcriptVersion: number;
 	model: ExtensionContext["model"];
+	thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>;
 	modelRegistry: ExtensionContext["modelRegistry"];
+	/** Per-clone credential view: account pins here never touch the lead or siblings. */
+	cloneAuth: AuthStorage;
+	/** /acc account profile last resolved for the clone's current model. */
+	account?: string;
+	/** Set while a user/lead pause request waits for the in-flight work to abort. */
+	pauseRequested?: "user" | "lead";
 	stopReason?: string;
 	errorMessage?: string;
 	summonedAt: number;
@@ -352,19 +526,9 @@ function formatTouchedFiles(clone: ShadowClone, max: number): string[] {
 	return [...files.slice(0, max), `+${files.length - max} more`];
 }
 
-/**
- * Conservative heuristic for provider safety/policy classifier blocks, matched against
- * common provider phrasings (content filter, usage policy, safety classifier). False
- * negatives are fine: the error then follows the normal retry/pause path and only the
- * advice text is less specific.
- */
-function isPolicyBlockedError(message: string): boolean {
-	return /content[ _-]?filter|content management policy|usage policy|policy violation|flagged as potentially violating|blocked by content filtering|safety (?:filter|classifier|system|reasons)/i.test(
-		message,
-	);
-}
-
 const RECOVERY_PROMPT = `Your previous turn failed mid-stream. This is usually a transient provider error or an overcautious refusal. Reminder: you are working in the user's own repository on the user's own product, fully authorized. Continue your task from where you left off; do not repeat work that already succeeded.`;
+
+const RESUME_AFTER_PAUSE_PROMPT = `Resume your task: continue from where you left off. Work already completed stands; do not redo it. If the previous attempt was cut off mid-request (pause or rate limit), just continue.`;
 
 const WaitForParamsSchema = Type.Object({
 	condition: StringEnum(["file_exists", "file_changed", "file_contains", "command_succeeds"] as const, {
@@ -515,13 +679,21 @@ interface CloneDashboardOptions {
 	getSpinnerGlyph: () => string;
 	send: (clone: ShadowClone, message: string) => void;
 	abort: (clone: ShadowClone) => void;
+	pause: (clone: ShadowClone) => void;
 	dispel: (clone: ShadowClone) => Promise<void>;
+	dispelWorker: (run: WorkerRunRecord, agentIndex?: number) => void;
 	done: () => void;
 	requestRender: () => void;
 }
 
-/** A dashboard row: an interactive clone, or a one-shot worker run (read-only, drill-in). */
-type DashItem = { kind: "clone"; clone: ShadowClone } | { kind: "worker"; run: WorkerRunRecord };
+/**
+ * A dashboard row: an interactive clone, a worker-run header, or one worker
+ * agent inside a run (agentIndex set). Multi-agent runs get one selectable row
+ * per agent, so each worker/council member can be watched individually.
+ */
+type DashItem =
+	| { kind: "clone"; clone: ShadowClone }
+	| { kind: "worker"; run: WorkerRunRecord; agentIndex?: number };
 
 export class CloneDashboard {
 	private readonly options: CloneDashboardOptions;
@@ -561,10 +733,18 @@ export class CloneDashboard {
 	}
 
 	private items(): DashItem[] {
-		return [
-			...this.options.getClones().map((clone) => ({ kind: "clone" as const, clone })),
-			...this.options.getWorkerRuns().map((run) => ({ kind: "worker" as const, run })),
-		];
+		const items: DashItem[] = this.options.getClones().map((clone) => ({ kind: "clone" as const, clone }));
+		for (const run of this.options.getWorkerRuns()) {
+			items.push({ kind: "worker", run });
+			// One row per agent so each worker is individually selectable; a
+			// single-agent run needs no sub-rows (the header pane already shows it).
+			if (run.details.agents.length > 1) {
+				for (let i = 0; i < run.details.agents.length; i++) {
+					items.push({ kind: "worker", run, agentIndex: i });
+				}
+			}
+		}
+		return items;
 	}
 
 	private selectedItem(): DashItem | undefined {
@@ -633,6 +813,10 @@ export class CloneDashboard {
 		} else if (data === "a") {
 			const clone = this.selectedClone();
 			if (clone) this.options.abort(clone);
+		} else if (data === "p") {
+			// Toggle: pause a running clone, resume a paused (or failure-paused) one.
+			const clone = this.selectedClone();
+			if (clone) this.options.pause(clone);
 		} else if (matchesKey(data, Key.enter)) {
 			// First Enter focuses the pane; a second Enter (now in pane focus) opens the steer input.
 			if (!this.paneFocus) {
@@ -642,12 +826,20 @@ export class CloneDashboard {
 				this.input.focused = this._focused;
 			}
 		} else if (data === "d") {
-			const clone = this.selectedClone();
-			if (clone) {
-				void this.options.dispel(clone).then(() => {
-					if (this.options.getClones().length === 0) this.options.done();
-					else this.options.requestRender();
+			const item = this.selectedItem();
+			if (item?.kind === "clone") {
+				void this.options.dispel(item.clone).then(() => {
+					if (this.options.getClones().length === 0 && this.options.getWorkerRuns().length === 0) {
+						this.options.done();
+					} else {
+						this.options.requestRender();
+					}
 				});
+			} else if (item?.kind === "worker") {
+				this.options.dispelWorker(item.run, item.agentIndex);
+				if (this.options.getClones().length === 0 && this.options.getWorkerRuns().length === 0) {
+					this.options.done();
+				}
 			}
 		}
 		this.options.requestRender();
@@ -681,6 +873,13 @@ export class CloneDashboard {
 		const rightWidth = Math.max(1, width - leftWidth - 1);
 
 		// Footer first, so the body knows how many rows remain.
+		const workerAction = (() => {
+			if (item?.kind !== "worker") return "";
+			const runActive = item.run.details.phase === "preparing" || item.run.details.phase === "executing";
+			if (!runActive) return "d dismiss run";
+			const agent = item.agentIndex === undefined ? undefined : item.run.details.agents[item.agentIndex];
+			return agent?.status === "pending" || agent?.status === "running" ? "d cancel worker" : "d cancel run";
+		})();
 		const footer: string[] = [];
 		const footerRule =
 			theme.fg("borderMuted", "─".repeat(leftWidth)) +
@@ -692,14 +891,14 @@ export class CloneDashboard {
 		} else if (this.paneFocus) {
 			const hint =
 				item?.kind === "worker"
-					? " ↑↓ scroll · ← back · esc back"
-					: " ↑↓ scroll · ↵ steer · ← back · a abort · d dispel · t thinking · esc back";
+					? ` ↑↓ scroll · ${workerAction} · ← back · esc back`
+					: " ↑↓ scroll · ↵ steer · ← back · a abort · p pause · d dispel · t thinking · esc back";
 			footer.push(padToWidth(theme.fg("dim", hint), width));
 		} else {
 			const hint =
 				item?.kind === "worker"
-					? " ↑↓ agent · →/↵ open pane · 1-9 jump · worker (read-only) · esc close"
-					: " ↑↓ agent · →/↵ scroll pane · 1-9 jump · a abort · d dispel · t thinking · esc close";
+					? ` ↑↓ agent · →/↵ open pane · 1-9 jump · ${workerAction} · esc close`
+					: " ↑↓ agent · →/↵ scroll pane · 1-9 jump · a abort · p pause · d dispel · t thinking · esc close";
 			footer.push(padToWidth(theme.fg("dim", hint), width));
 		}
 
@@ -713,7 +912,14 @@ export class CloneDashboard {
 		leftCells.push(
 			padToWidth(` ${theme.fg("accent", theme.bold("Agents"))}${theme.fg("dim", `  ${counts}`)}`, leftWidth),
 		);
-		items.forEach((it, index) => {
+		// Window the sidebar so the selected row stays visible when rows overflow.
+		const visibleRows = Math.max(1, bodyHeight - 1);
+		let start = 0;
+		if (items.length > visibleRows) {
+			start = Math.min(Math.max(0, this.selected - Math.floor(visibleRows / 2)), items.length - visibleRows);
+		}
+		items.slice(start, start + visibleRows).forEach((it, offset) => {
+			const index = start + offset;
 			const selected = index === this.selected;
 			let row: string;
 			if (it.kind === "clone") {
@@ -731,7 +937,7 @@ export class CloneDashboard {
 					if (spare >= 5) left += ` ${theme.fg("dim", truncateSingleLine(c.worktreeLabel, Math.min(14, spare)))}`;
 				}
 				row = composeRow(left, theme.fg("dim", age), leftWidth);
-			} else {
+			} else if (it.agentIndex === undefined) {
 				const r = it.run;
 				const { total, done, failed } = workerCounts(r);
 				const icon = workerPhaseIcon(theme, r.details.phase, spinnerGlyph);
@@ -744,6 +950,13 @@ export class CloneDashboard {
 					theme.bold(`⚙ ${truncateSingleLine(r.title, Math.max(4, room))}`),
 				);
 				row = composeRow(` ${icon} ${name}`, theme.fg(failed > 0 ? "error" : "dim", counts), leftWidth);
+			} else {
+				// Indented member row under its run header.
+				const agent = it.run.details.agents[it.agentIndex];
+				const icon = agentStatusIcon(theme, agent?.status ?? "pending", spinnerGlyph);
+				const title = agent?.title ?? `worker ${it.agentIndex + 1}`;
+				const name = theme.fg(selected ? "accent" : "muted", truncateSingleLine(title, Math.max(4, leftWidth - 7)));
+				row = padToWidth(`   ${icon} ${name}`, leftWidth);
 			}
 			// The active highlight lives on the sidebar in list focus, and moves to the pane header in pane focus.
 			leftCells.push(selected && !this.paneFocus ? theme.bg("selectedBg", row) : row);
@@ -767,6 +980,13 @@ export class CloneDashboard {
 			pushRight(` ${focusMark}${theme.fg("accent", theme.bold(`@${c.name}`))} ${theme.fg("dim", "· clone activity")}`);
 			pushRight(statusHead + theme.fg("dim", truncateSingleLine(c.lastActivity, activityRoom)));
 			pushRight(` ${theme.fg("muted", "task")}  ${theme.fg("text", truncateSingleLine(c.task, Math.max(10, rightWidth - 8)))}`);
+			{
+				const modelText = formatModelSpec(c.model) ?? "lead model";
+				const accPart = c.account ? theme.fg("dim", " · acc ") + theme.fg("accent", c.account) : "";
+				pushRight(
+					` ${theme.fg("muted", "model")} ${theme.fg("text", truncateSingleLine(modelText, Math.max(10, rightWidth - 32)))}${theme.fg("dim", ` · thinking ${c.thinkingLevel}`)}${accPart}`,
+				);
+			}
 			if (c.worktreeLabel) {
 				const branch = theme.fg("success", truncateSingleLine(c.worktreeLabel, Math.max(6, rightWidth - 32)));
 				const where = c.cwd ? theme.fg("dim", `  ${truncateSingleLine(c.cwd, 24)}`) : "";
@@ -779,6 +999,41 @@ export class CloneDashboard {
 			if (this.wrapCache?.key === cacheKey) wrapped = this.wrapCache.lines;
 			else {
 				wrapped = this.renderTranscript(c, Math.max(10, rightWidth - 2));
+				this.wrapCache = { key: cacheKey, lines: wrapped };
+			}
+		} else if (item?.kind === "worker" && item.agentIndex !== undefined) {
+			// One worker/council member: its own live pane, like a clone's.
+			const r = item.run;
+			const agent = r.details.agents[item.agentIndex];
+			const bits = agentStatusBits(agent?.status ?? "pending");
+			const icon = agentStatusIcon(theme, agent?.status ?? "pending", spinnerGlyph);
+			const origin = r.origin === "lead" ? "lead" : `@${r.origin}`;
+			const title = agent?.title ?? `worker ${item.agentIndex + 1}`;
+			pushRight(
+				` ${focusMark}${theme.fg("accent", theme.bold(truncateSingleLine(title, Math.max(6, rightWidth - 18))))} ${theme.fg("dim", `· worker ${item.agentIndex + 1}/${r.details.agents.length}`)}`,
+			);
+			const statusHead = ` ${icon} ${theme.fg(bits.tone, bits.word)} ${theme.fg("muted", `· ⏱ ${formatAgeShort(r.startedAt)} · by ${origin} · `)}`;
+			const activityRoom = Math.max(8, rightWidth - visibleWidth(statusHead) - 1);
+			pushRight(statusHead + theme.fg("dim", truncateSingleLine(agent?.lastActivity ?? "", activityRoom)));
+			const modelSpec = agent?.model ?? r.details.model;
+			if (modelSpec) {
+				const account = agent?.account ?? r.details.account;
+				const effectiveThinking = agent?.thinking ?? r.details.thinking;
+				const thinking = effectiveThinking ? theme.fg("dim", ` · thinking ${effectiveThinking}`) : "";
+				const accPart = account ? theme.fg("dim", " · acc ") + theme.fg("accent", account) : "";
+				pushRight(
+					` ${theme.fg("muted", "model")} ${theme.fg("text", truncateSingleLine(modelSpec, Math.max(10, rightWidth - 32)))}${thinking}${accPart}`,
+				);
+			}
+			if (r.details.focus) {
+				pushRight(` ${theme.fg("muted", "focus")} ${theme.fg("text", truncateSingleLine(r.details.focus, Math.max(10, rightWidth - 8)))}`);
+			}
+			ruleRowIndex = rightCells.length;
+			pushRight(rightRule);
+			const cacheKey = `worker:${r.id}:agent${item.agentIndex}:${rightWidth}:${r.version}`;
+			if (this.wrapCache?.key === cacheKey) wrapped = this.wrapCache.lines;
+			else {
+				wrapped = agent ? this.renderWorkerAgent(agent, Math.max(10, rightWidth - 2)) : [];
 				this.wrapCache = { key: cacheKey, lines: wrapped };
 			}
 		} else if (item?.kind === "worker") {
@@ -800,6 +1055,13 @@ export class CloneDashboard {
 			pushRight(
 				` ${workerPhaseIcon(theme, r.details.phase, spinnerGlyph)} ${theme.fg(phaseColor, r.details.phase)} ${bar} ${theme.fg("muted", `${parts.join(" · ")} · ⏱ ${formatAgeShort(r.startedAt)} · by ${origin}`)}`,
 			);
+			if (r.details.model) {
+				const thinking = r.details.thinking ? theme.fg("dim", ` · thinking ${r.details.thinking}`) : "";
+				const accPart = r.details.account ? theme.fg("dim", " · acc ") + theme.fg("accent", r.details.account) : "";
+				pushRight(
+					` ${theme.fg("muted", "start model")} ${theme.fg("text", truncateSingleLine(r.details.model, Math.max(10, rightWidth - 32)))}${thinking}${accPart}`,
+				);
+			}
 			if (r.details.focus) {
 				pushRight(` ${theme.fg("muted", "focus")} ${theme.fg("text", truncateSingleLine(r.details.focus, Math.max(10, rightWidth - 8)))}`);
 			}
@@ -818,7 +1080,11 @@ export class CloneDashboard {
 		// Scroll-follow UX: at the bottom (scrollOffset 0) the pane auto-follows new output; once the
 		// user scrolls up it stays pinned to what they're reading — new lines no longer yank it down.
 		// (Switching agents resets to live via switchItem.)
-		const itemKey = item ? (item.kind === "clone" ? `c:${item.clone.name}` : `w:${item.run.id}`) : "";
+		const itemKey = item
+			? item.kind === "clone"
+				? `c:${item.clone.name}`
+				: `w:${item.run.id}:${item.agentIndex ?? "run"}`
+			: "";
 		if (itemKey !== this.followItemKey) this.followItemKey = itemKey;
 		else if (this.scrollOffset > 0) this.scrollOffset = Math.max(0, this.scrollOffset + (wrapped.length - this.lastWrappedLen));
 		this.lastWrappedLen = wrapped.length;
@@ -865,33 +1131,38 @@ export class CloneDashboard {
 	private renderWorkerRun(run: WorkerRunRecord, width: number): string[] {
 		const theme = this.options.theme;
 		const wrap = (raw: string): string[] => (visibleWidth(raw) <= width ? [raw] : wrapTextWithAnsi(raw, width));
-		const bits = (status: SwarmStatus): { icon: string; word: string; tone: "success" | "error" | "warning" | "muted" } => {
-			if (status === "done") return { icon: "✔", word: "done", tone: "success" };
-			if (status === "failed") return { icon: "✗", word: "failed", tone: "error" };
-			if (status === "running") return { icon: "▸", word: "running", tone: "warning" };
-			return { icon: "○", word: "queued", tone: "muted" };
-		};
 		const lines: string[] = [];
 		for (const agent of run.details.agents) {
-			const { icon, word, tone } = bits(agent.status);
+			const { icon, word, tone } = agentStatusBits(agent.status);
 			// A dotted rule between sections makes each worker's block obvious at a glance.
 			if (lines.length > 0) {
 				lines.push("");
 				lines.push(theme.fg("borderMuted", "┄".repeat(width)));
 				lines.push("");
 			}
+			const effectiveThinking = agent.thinking ?? run.details.thinking;
+			const modelNote = agent.model
+				? theme.fg("dim", ` · ${agent.model}${effectiveThinking ? ` · thinking ${effectiveThinking}` : ""}`)
+				: effectiveThinking
+					? theme.fg("dim", ` · thinking ${effectiveThinking}`)
+					: "";
 			lines.push(
 				...wrap(
-					`${theme.fg(tone, icon)} ${theme.fg("accent", theme.bold(`${agent.index + 1}. ${agent.title}`))} ${theme.fg(tone, `— ${word}`)}`,
+					`${theme.fg(tone, icon)} ${theme.fg("accent", theme.bold(`${agent.index + 1}. ${agent.title}`))} ${theme.fg(tone, `— ${word}`)}${modelNote}`,
 				),
 			);
-			if (agent.status === "running" || agent.status === "pending") {
+			const active = agent.status === "running" || agent.status === "pending";
+			// Surface terminal failures in red; an in-flight provider error is a recovery
+			// state (compaction/retry), not a dead worker.
+			if (agent.errorMessage) {
+				const message = `${active ? "  recovering from: " : "  "}${truncateSingleLine(agent.errorMessage, 300)}`;
+				lines.push(...wrap(theme.fg(active ? "warning" : "error", message)));
+			}
+			if (active) {
 				if (agent.lastActivity) lines.push(...wrap(theme.fg("dim", `  ${agent.lastActivity}`)));
 				for (const it of agent.items.slice(-3)) lines.push(...wrap(theme.fg("muted", `  · ${formatDisplayItem(it)}`)));
 				continue;
 			}
-			// Settled: surface the failure first, then the report.
-			if (agent.errorMessage) lines.push(...wrap(theme.fg("error", `  ${truncateSingleLine(agent.errorMessage, 300)}`)));
 			if (agent.output.trim()) {
 				lines.push("");
 				lines.push(...new Markdown(agent.output.trim(), 0, 0, this.markdownTheme).render(width));
@@ -900,6 +1171,28 @@ export class CloneDashboard {
 			}
 		}
 		if (lines.length === 0) lines.push(theme.fg("dim", "no worker activity yet"));
+		return lines;
+	}
+
+	/** Full activity of one worker/council member: its tool/thinking trail, then its (streaming) report. */
+	private renderWorkerAgent(agent: SwarmAgentProgress, width: number): string[] {
+		const theme = this.options.theme;
+		const wrap = (raw: string): string[] => (visibleWidth(raw) <= width ? [raw] : wrapTextWithAnsi(raw, width));
+		const lines: string[] = [];
+		for (const it of agent.items) lines.push(...wrap(theme.fg("muted", `· ${formatDisplayItem(it)}`)));
+		if (agent.errorMessage) {
+			if (lines.length > 0) lines.push("");
+			const recovering = agent.status === "running" || agent.status === "pending";
+			const message = `${recovering ? "recovering from: " : ""}${truncateSingleLine(agent.errorMessage, 300)}`;
+			lines.push(...wrap(theme.fg(recovering ? "warning" : "error", message)));
+		}
+		if (agent.output.trim()) {
+			if (lines.length > 0) lines.push("");
+			lines.push(...new Markdown(agent.output.trim(), 0, 0, this.markdownTheme).render(width));
+		} else if (agent.status === "done") {
+			lines.push(...wrap(theme.fg("dim", "(no report returned)")));
+		}
+		if (lines.length === 0) lines.push(theme.fg("dim", "no activity yet"));
 		return lines;
 	}
 
@@ -1006,13 +1299,22 @@ class SummonCard {
 		for (const summon of summons) {
 			const name = `@${summon.name}`.padEnd(nameWidth + 1);
 			const keepTag = summon.keep ? theme.fg("warning", " ↻ stays") : "";
+			// Keep the canonical spec intact: arbitrary model ids may contain slashes,
+			// so taking only the last path segment can make distinct models look identical.
+			const accTag = theme.fg(
+				"dim",
+				` · ${summon.modelSpec ?? "lead model"} · thinking ${summon.thinking}${summon.account ? ` · ${summon.account}` : ""}`,
+			);
 			row(
 				` ${theme.fg("accent", theme.bold(name))} ${theme.fg(
 					"text",
 					truncateSingleLine(summon.task, Math.max(10, inner - nameWidth - 12)),
-				)}${keepTag}`,
+				)}${keepTag}${accTag}`,
 			);
 			if (this.expanded) {
+				row(
+					`   ${theme.fg("muted", "model:")} ${theme.fg("dim", `${summon.modelSpec ?? "lead model"} · thinking ${summon.thinking}${summon.account ? ` · acc ${summon.account}` : ""}`)}`,
+				);
 				if (summon.persona?.trim()) {
 					row(`   ${theme.fg("muted", "persona:")} ${theme.fg("dim", truncateSingleLine(summon.persona, Math.max(10, inner - 14)))}`);
 				}
@@ -1139,9 +1441,9 @@ function formatAgeShort(summonedAt: number): string {
 }
 
 /**
- * Lead's active worktree, read from session state persisted by a worktree extension
- * (custom entries with customType "pi-dev-worktrees:state"). Optional integration: when
- * no such extension is installed this is undefined and clones fall back to the repo root.
+ * Lead's active worktree, read from the pi-dev-worktrees session state (the custom entry
+ * that extension persists). Decoupled: if pi-dev-worktrees is not installed this is undefined
+ * and clones fall back to the repo root.
  */
 function readLeadWorktree(ctx: ExtensionContext): { branch: string; path: string } | undefined {
 	try {
@@ -1155,7 +1457,7 @@ function readLeadWorktree(ctx: ExtensionContext): { branch: string; path: string
 			return { branch: last.worktree.branch, path: last.worktree.path };
 		}
 	} catch {
-		// No worktree extension state, or session entries unreadable.
+		// No pi-dev-worktrees state, or session entries unreadable.
 	}
 	return undefined;
 }
@@ -1211,6 +1513,35 @@ export function asSwarmDetails(value: unknown): SwarmDetails | undefined {
 	return Array.isArray(details.agents) && typeof details.phase === "string" ? (details as SwarmDetails) : undefined;
 }
 
+/** Abort clone work without letting an abort-ignoring provider block dispel or shutdown forever. */
+export async function abortCloneSession(
+	session: Pick<AgentSession, "abortCompaction" | "abort">,
+	graceMs: number = CLONE_ABORT_GRACE_MS,
+): Promise<boolean> {
+	try {
+		session.abortCompaction();
+	} catch {
+		// Continue to the bounded abort attempt even if compaction cleanup itself failed.
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			Promise.resolve()
+				.then(() => session.abort())
+				.then(
+					() => true,
+					() => true,
+				),
+			new Promise<false>((resolve) => {
+				timer = setTimeout(() => resolve(false), graceMs);
+				timer.unref?.();
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 export function registerShadowClones(pi: ExtensionAPI): void {
 	const settings = readSwarmSettings();
 	// Opt-in deepest tier: only when enabled do clones get worker_run (and its prompt bullet).
@@ -1232,10 +1563,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 	let isLeadIdle: (() => boolean) | undefined;
 
 	const getLoader = (cwd: string): Promise<ResourceLoader> => {
-		loaderPromise ??= createSubagentLoader(
-			cwd,
-			buildCloneSystemPrompt(cloneWorkers, settings.modelTiers && settings.workerModel ? settings.workerModel : undefined),
-		);
+		loaderPromise ??= createSubagentLoader(cwd, buildCloneSystemPrompt(cloneWorkers));
 		return loaderPromise;
 	};
 
@@ -1313,7 +1641,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 					)}`,
 			);
 		} else {
-			const counts: Record<CloneStatus, number> = { working: 0, waiting: 0, idle: 0, failed: 0 };
+			const counts: Record<CloneStatus, number> = { working: 0, waiting: 0, idle: 0, paused: 0, failed: 0 };
 			for (const clone of clones.values()) counts[clone.status]++;
 			parts = [
 				theme.fg("accent", `⊛ ${clones.size} clones`),
@@ -1352,7 +1680,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		dashboardRefresh?.();
 	}, WIDGET_THROTTLE_MS);
 	// Worker runs live in a shared registry; mirror their changes into the widget and dashboard.
-	onWorkerRunsChange(() => {
+	const unsubscribeWorkerRuns = onWorkerRunsChange(() => {
 		renderWidget();
 		dashboardRefresh?.();
 	});
@@ -1391,6 +1719,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			log(clone, "status", "status: follow-up during linger — staying alive (keep)");
 		}
 		clone.pendingQuestion = false;
+		clone.pauseRequested = undefined; // new instructions cancel a pending pause
 		log(clone, from, message.trim());
 		if (from === "user") {
 			pi.sendMessage(
@@ -1436,7 +1765,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			batch.length === 1
 				? [batch[0].content, batch[0].details]
 				: [
-						`${batch.length} shadow clone reports:\n\n${batch.map((r) => r.content).join("\n\n———\n\n")}`,
+						truncateCloneReportBatch(batch.map((report) => report.content)),
 						// Carry the contributing clone names so the session_start re-seed can still
 						// recover them after a resume (a coalesced batch has no single details.name).
 						{
@@ -1472,7 +1801,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 	};
 
 	const deliverReport = (name: string, kind: string, body: string, urgent: boolean) => {
-		const content = `Shadow clone @${name} ${kind}:\n\n${body}`;
+		const content = truncateCloneReport(`Shadow clone @${name} ${kind}:\n\n${body}`);
 		if (urgent) {
 			pi.sendMessage(
 				{ customType: SHADOWCLONE_REPORT_TYPE, content, display: true, details: { name, kind } },
@@ -1561,9 +1890,9 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			while (isNameTaken(`${base}-${i}`)) i++;
 			return `${base}-${i}`;
 		}
-		for (const name of NAME_POOL) {
-			if (!isNameTaken(name)) return name;
-		}
+		// Random pick, so waves don't always open with the same names.
+		const available = NAME_POOL.filter((name) => !isNameTaken(name));
+		if (available.length > 0) return available[Math.floor(Math.random() * available.length)];
 		for (let attempt = 0; attempt < 50; attempt++) {
 			const name = generateNarutoName();
 			if (!isNameTaken(name)) return name;
@@ -1609,25 +1938,34 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 					: transcriptText;
 			// Abort the request on timeout so an orphaned model call does not keep burning tokens.
 			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), MEMORY_DISTILL_TIMEOUT_MS);
-			timer.unref?.();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => {
+					controller.abort();
+					reject(new Error("Clone memory distillation timed out."));
+				}, MEMORY_DISTILL_TIMEOUT_MS);
+				timer.unref?.();
+			});
 			let response: Awaited<ReturnType<typeof complete>>;
 			try {
-				response = await complete(
-					model,
-					{
-						messages: [
-							{
-								role: "user",
-								content: [{ type: "text", text: buildMemoryPrompt(clone, reason, tail) }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{ apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal },
-				);
+				response = await Promise.race([
+					complete(
+						model,
+						{
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "text", text: buildMemoryPrompt(clone, reason, tail) }],
+									timestamp: Date.now(),
+								},
+							],
+						},
+						{ apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal },
+					),
+					timeout,
+				]);
 			} finally {
-				clearTimeout(timer);
+				if (timer) clearTimeout(timer);
 			}
 			const digest = response.content
 				.filter((part): part is { type: "text"; text: string } => part.type === "text")
@@ -1645,15 +1983,34 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 	const runInstruction = (clone: ShadowClone, prompt: string, isRetry = false) => {
 		clone.status = "working";
 		clone.lastActivity = isRetry ? "retrying after failure" : "starting";
+		clone.stopReason = undefined;
+		clone.errorMessage = undefined;
+		clone.pauseRequested = undefined;
 		if (!isRetry) clone.retriedInstruction = false;
 		widgetEmitter.schedule();
 		void clone.session
 			.prompt(prompt, { expandPromptTemplates: false, source: "extension" })
 			.then(() => {
 				if (clones.get(clone.name) !== clone) return;
-				const failed = clone.stopReason === STOP_REASON_ERROR || clone.stopReason === STOP_REASON_ABORTED;
+				// A deliberate pause aborted the in-flight work; unless the turn managed to
+				// finish anyway, park the clone quietly instead of treating it as a failure.
+				const pausedBy = clone.pauseRequested;
+				if (pausedBy && clone.stopReason !== "stop") {
+					enterManualPause(clone, pausedBy);
+					return;
+				}
+				clone.pauseRequested = undefined;
+				const failed = clone.stopReason !== "stop";
 				if (failed) {
-					const reason = clone.errorMessage ? `failed: ${clone.errorMessage}` : `failed (${clone.stopReason})`;
+					const reason = clone.errorMessage
+						? `failed: ${clone.errorMessage}`
+						: `failed (${clone.stopReason ?? "no terminal response"})`;
+					// Rate/usage limits: retrying into the same window just burns it, and
+					// falling back to another model is against policy — auto-pause instead.
+					if (isRateLimitedError(clone.errorMessage)) {
+						pauseClone(clone, reason, "rate-limit");
+						return;
+					}
 					// Provider errors are mostly transient capacity blips; one automatic retry
 					// usually recovers. Two exceptions: deliberate aborts, and safety/policy
 					// classifier blocks — the flagged content stays in the clone's context, so
@@ -1680,10 +2037,15 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 				const report = clone.lastOutput.trim() || "(no report text)";
 				// Deterministic deliverables footer: the lead commits clones' work, so the
 				// created/modified file list must never depend on the clone remembering to list it.
-				const reportBody =
+				const reportBody = [
+					report,
 					clone.touchedFiles.size > 0
-						? `${report}\n\nFiles touched (edit/write): ${formatTouchedFiles(clone, 20).join(", ")}`
-						: report;
+						? `Files touched (edit/write): ${formatTouchedFiles(clone, 20).join(", ")}`
+						: "",
+					`Full log: ${clone.logPath}`,
+				]
+					.filter(Boolean)
+					.join("\n\n");
 				if (!clone.keep) {
 					log(clone, "status", `status: completed (one-shot) — lingering ${LINGER_MINUTES}m for follow-ups`);
 					deliverReport(
@@ -1711,6 +2073,15 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 				if (clones.get(clone.name) !== clone) return;
 				clone.errorMessage = error instanceof Error ? error.message : String(error);
 				log(clone, "status", `error: ${clone.errorMessage}`);
+				const pausedBy = clone.pauseRequested;
+				if (pausedBy) {
+					enterManualPause(clone, pausedBy);
+					return;
+				}
+				if (isRateLimitedError(clone.errorMessage)) {
+					pauseClone(clone, `failed: ${clone.errorMessage}`, "rate-limit");
+					return;
+				}
 				if (!clone.retriedInstruction && !isPolicyBlockedError(clone.errorMessage)) {
 					clone.retriedInstruction = true;
 					log(clone, "status", "status: retrying once after error");
@@ -1721,17 +2092,54 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			});
 	};
 
+	/** Paused-on-request state: nothing running, session and context intact, no urgent lead report. */
+	const enterManualPause = (clone: ShadowClone, by: "user" | "lead"): void => {
+		clone.pauseRequested = undefined;
+		clone.status = "paused";
+		clone.pendingQuestion = false;
+		clone.stopReason = undefined;
+		clone.errorMessage = undefined;
+		clone.lastActivity = "paused — resume via shadowclone_send or the dashboard (p)";
+		widgetEmitter.flush();
+		log(clone, "status", `status: paused by ${by} (session intact)`);
+	};
+
+	/**
+	 * Temporarily pause a clone: any in-flight work is aborted (that turn's spend is
+	 * lost) but the session and its context stay intact, so a later shadowclone_send
+	 * (or shadowclone_account switch) resumes exactly where it stopped.
+	 */
+	const requestClonePause = (clone: ShadowClone, by: "user" | "lead"): "paused" | "pausing" | "noop" => {
+		if (clone.status === "paused" || clone.status === "failed" || clone.status === "idle" || clone.lingerTimer) {
+			return "noop";
+		}
+		clone.pauseRequested = by;
+		if (clone.session.isStreaming) {
+			log(clone, "status", `── pause requested by ${by}; aborting in-flight work`);
+			clone.session.abortCompaction();
+			void clone.session.abort();
+			return "pausing";
+		}
+		enterManualPause(clone, by);
+		return "paused";
+	};
+
 	/**
 	 * A clone that failed twice pauses instead of dying: its session and prompt cache stay
 	 * alive so the lead can rephrase via shadowclone_send (cheap) instead of restarting a
-	 * fresh clone from a digest (expensive).
+	 * fresh clone from a digest (expensive). Rate/usage-limit errors (429) pause on the
+	 * FIRST hit — no retry, no fallback model — since only time or another account fixes them.
 	 */
-	const pauseClone = (clone: ShadowClone, reason: string): void => {
-		clone.status = "failed";
+	const pauseClone = (clone: ShadowClone, reason: string, cause: "failure" | "rate-limit" = "failure"): void => {
+		const rateLimited = cause === "rate-limit";
+		clone.status = rateLimited ? "paused" : "failed";
 		clone.pendingQuestion = false;
-		clone.lastActivity = "paused after failure — steer or dispel";
+		clone.pauseRequested = undefined;
+		clone.lastActivity = rateLimited
+			? "auto-paused: rate limit — switch account or resume later"
+			: "paused after failure — steer or dispel";
 		widgetEmitter.flush();
-		log(clone, "status", `status: paused (${reason})`);
+		log(clone, "status", `status: ${rateLimited ? "auto-paused on rate limit" : "paused"} (${reason})`);
 		const recentTools = clone.items
 			.filter((item) => item.type === "tool")
 			.slice(-5)
@@ -1739,8 +2147,11 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		// Policy classifier blocks poison the session: the flagged content stays in
 		// context and re-triggers the block, so "resend and affirm" is the wrong
 		// advice — a fresh context (or another provider) is the way out.
-		const advice =
-			!!clone.errorMessage && isPolicyBlockedError(clone.errorMessage)
+		const provider = clone.model?.provider;
+		const otherAccounts = rateLimited && provider ? listAccountProfiles(provider).filter((name) => name !== clone.account) : [];
+		const advice = rateLimited
+			? `A provider rate/usage limit was hit. By design there is no automatic retry and no fallback model: the clone auto-paused with its session and context intact. Options: switch it to another saved /acc account with shadowclone_account {name: "${clone.name}", account: "<profile>"} — it resumes automatically${otherAccounts.length > 0 ? ` (saved ${provider} profiles: ${otherAccounts.join(", ")})` : ""}; wait for the limit window to reset and resume via shadowclone_send; or shadowclone_dispel @${clone.name} to collect memories.`
+			: !!clone.errorMessage && isPolicyBlockedError(clone.errorMessage)
 				? `A provider safety classifier blocked the request (likely a false positive; the work is on the user's own product). The flagged content stays in this clone's context, so resending into this session will most likely be blocked again. Instead: shadowclone_dispel @${clone.name} to collect its memories, then resummon a FRESH clone with a rephrased task that avoids pasting the trigger content (optionally pass model: "provider/model-id" to use another provider). When retry.fallbackModels is configured in settings, sessions reroute blocked requests to the fallback model automatically.`
 				: `The session and its context are intact. Refusals are usually transient provider errors or overcautious safety — resend instructions via shadowclone_send, affirming the work is on the user's own product. Or shadowclone_dispel @${clone.name} to collect memories.`;
 		const body = [
@@ -1755,8 +2166,13 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		]
 			.filter(Boolean)
 			.join("\n\n");
-		deliverReport(clone.name, "hit a failure and paused (session intact)", body, true);
-		markSettled(clone, "paused after failure");
+		deliverReport(
+			clone.name,
+			rateLimited ? "hit a provider rate limit and auto-paused (session intact)" : "hit a failure and paused (session intact)",
+			body,
+			true,
+		);
+		markSettled(clone, rateLimited ? "auto-paused (rate limit)" : "paused after failure");
 	};
 
 	const dispelClone = async (clone: ShadowClone): Promise<void> => {
@@ -1768,7 +2184,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		clones.delete(clone.name);
 		clone.unsubscribe();
 		try {
-			if (clone.session.isStreaming) await clone.session.abort();
+			await abortCloneSession(clone.session);
 		} finally {
 			clone.session.dispose();
 		}
@@ -1806,9 +2222,12 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 	};
 
 	const formatCloneStatus = (clone: ShadowClone): string => {
-		const modelTag = clone.model ? `, ${clone.model.id}` : "";
+		const modelTag = `, ${formatModelSpec(clone.model) ?? "lead model"}, thinking ${clone.thinkingLevel}`;
+		// The clone's account is pinned in its own credential view, so the label
+		// cannot drift under a lead /acc switch; shadowclone_account changes it.
+		const accTag = clone.account ? ` · acc ${clone.account}` : "";
 		const lines = [
-			`@${clone.name} — ${clone.status} (${formatAge(clone.summonedAt)}, ctx ${Math.round(clone.lastTotalTokens / 1000)}k${modelTag})`,
+			`@${clone.name} — ${clone.status} (${formatAge(clone.summonedAt)}, ctx ${Math.round(clone.lastTotalTokens / 1000)}k${modelTag}${accTag})`,
 			`  task: ${truncateSingleLine(clone.task, 120)}`,
 			`  last: ${truncateSingleLine(clone.lastActivity, 200)}`,
 			`  watch: tail -f ${clone.logPath}`,
@@ -1829,26 +2248,35 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		siblings: { name: string; task: string }[],
 		waveId: number | undefined,
 	): Promise<SummonInfo> => {
-		const { name, task, keep, persona, cwd: cloneCwd, worktreeLabel } = spec;
+		const { name, task, keep, persona, cwd: cloneCwd, worktreeLabel, thinkingLevel } = spec;
 		mkdirSync(logDir, { recursive: true });
 		const logPath = path.join(logDir, `${name}.log`);
 		const resourceLoader = await getLoader(ctx.cwd);
-		// Model choice, most specific wins: an explicit per-clone request from the summon
-		// call, else the architect tier (when Model tiers is on), else the lead's model.
-		// Every step falls back so a bad spec can never block a summon.
-		const requestedModel = resolveSpawnModel(ctx.modelRegistry, spec.model, settings);
-		const cloneModel =
-			requestedModel ??
-			(settings.modelTiers ? (resolveTierModel(ctx.modelRegistry, settings.cloneModel) ?? ctx.model) : ctx.model);
-		const cloneWorkerModel = settings.modelTiers
-			? (resolveTierModel(ctx.modelRegistry, settings.workerModel) ?? ctx.model)
-			: ctx.model;
+		let currentCloneModel = spec.model ?? ctx.model;
+		let currentCloneThinking = thinkingLevel;
+		// Per-clone auth view: the clone inherits the lead's live account by default,
+		// but its pins are isolated, so a summon-time `account` override or a later
+		// shadowclone_account switch never touches the lead or sibling clones.
+		const cloneAuth = createCloneAuthStorage(ctx.modelRegistry.authStorage);
+		const cloneRegistry = createCloneModelRegistry(ctx.modelRegistry, cloneAuth);
+		if (spec.account) {
+			if (!currentCloneModel) {
+				throw new Error(`Clone @${name}: account "${spec.account}" requires a resolved model provider.`);
+			}
+			await pinCloneAccount(cloneAuth, currentCloneModel.provider, spec.account);
+		}
+		// Pin the attribution at summon: which model and which /acc account this clone
+		// starts under, so every surface (card, dashboard, status, log) can show it.
+		const modelSpec = formatModelSpec(currentCloneModel);
+		const account = currentCloneModel
+			? resolveAccountLabel(cloneAuth, currentCloneModel.provider)
+			: undefined;
 		const { session } = await createAgentSession({
 			cwd: cloneCwd,
 			agentDir: getAgentDir(),
-			model: cloneModel,
-			modelRegistry: ctx.modelRegistry,
-			thinkingLevel: pi.getThinkingLevel(),
+			model: currentCloneModel,
+			modelRegistry: cloneRegistry,
+			thinkingLevel,
 			tools: cloneToolNames(cloneWorkers),
 			customTools: [
 				createReportTool(name),
@@ -1866,9 +2294,10 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 							createSwarmTool(
 								() => ({
 									cwd: cloneCwd,
-									model: cloneWorkerModel,
-									modelRegistry: ctx.modelRegistry,
-									thinkingLevel: pi.getThinkingLevel(),
+									model: currentCloneModel,
+									// Nested workers inherit the clone's account, not the lead's.
+									modelRegistry: cloneRegistry,
+									thinkingLevel: currentCloneThinking,
 								}),
 								() => name,
 							),
@@ -1878,6 +2307,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			resourceLoader,
 			sessionManager: SessionManager.inMemory(ctx.cwd),
 		});
+		currentCloneThinking = session.thinkingLevel;
 		const clone: ShadowClone = {
 			name,
 			task,
@@ -1893,8 +2323,11 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			items: [],
 			transcript: [],
 			transcriptVersion: 0,
-			model: cloneModel,
-			modelRegistry: ctx.modelRegistry,
+			model: currentCloneModel,
+			thinkingLevel: currentCloneThinking,
+			modelRegistry: cloneRegistry,
+			cloneAuth,
+			account,
 			summonedAt: Date.now(),
 			cwd: cloneCwd,
 			worktreeLabel,
@@ -1904,6 +2337,28 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			waveId,
 		};
 		clone.unsubscribe = session.subscribe((event) => {
+			if (event.type === "thinking_level_changed") {
+				currentCloneThinking = event.level;
+				clone.thinkingLevel = event.level;
+				clone.lastActivity = `thinking level: ${event.level}`;
+				log(clone, "status", `status: thinking level ${event.level}`);
+				widgetEmitter.flush();
+				return;
+			}
+			const transition = getModelTransition(event);
+			if (transition) {
+				currentCloneModel = transition.model;
+				clone.model = transition.model;
+				clone.account = resolveAccountLabel(cloneAuth, transition.model.provider);
+				clone.lastActivity = transition.activity;
+				log(
+					clone,
+					"status",
+					`status: ${transition.activity}${clone.account ? ` · acc ${clone.account}` : ""}`,
+				);
+				widgetEmitter.flush();
+				return;
+			}
 			if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write")) {
 				const filePath = getToolPathArg(event.args);
 				if (filePath) clone.touchedFiles.add(path.resolve(cloneCwd, filePath));
@@ -1940,8 +2395,10 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			if (clone.items.length > ITEMS_MAX) clone.items.splice(0, clone.items.length - ITEMS_MAX);
 			if (!update) return;
 			if (update.output !== undefined) clone.lastOutput = update.output;
-			if (update.stopReason !== undefined) clone.stopReason = update.stopReason;
-			if (update.errorMessage !== undefined) clone.errorMessage = update.errorMessage;
+			// message_end deliberately carries own properties with undefined values on
+			// success; use property presence so a recovered turn clears stale failures.
+			if ("stopReason" in update) clone.stopReason = update.stopReason;
+			if ("errorMessage" in update) clone.errorMessage = update.errorMessage;
 			if (event.type === "tool_execution_start" && update.lastActivity) log(clone, "tool", update.lastActivity);
 			clone.lastActivity = update.lastActivity ?? "working";
 			widgetEmitter.schedule();
@@ -1949,8 +2406,24 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		clones.set(name, clone);
 		registerGlobal(name, cloneCwd, task);
 		log(clone, "lead", task.trim(), "summoned for task");
+		log(
+			clone,
+			"status",
+			`status: model ${modelSpec ?? "lead default"} · thinking ${currentCloneThinking}${account ? ` · acc ${account}` : ""}`,
+		);
 		runInstruction(clone, buildClonePrompt(name, task, persona, siblings));
-		return { ...spec, logPath };
+		return {
+			name,
+			task,
+			keep,
+			persona,
+			cwd: cloneCwd,
+			worktreeLabel,
+			logPath,
+			modelSpec,
+			thinking: currentCloneThinking,
+			account,
+		};
 	};
 
 	pi.registerTool<typeof SummonParamsSchema, SummonDetails>({
@@ -1961,30 +2434,56 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		promptSnippet:
 			"Summon persistent named shadow clone subagents to work on tasks in the background while you continue.",
 		promptGuidelines: [
-			"Use shadowclone_summon for long-running or parallel work; use worker_run for one-shot fire-and-forget fan-out. Summon all clones for a request in ONE shadowclone_summon call.",
+			settings.workers
+				? "Use shadowclone_summon for long-running or parallel work; use worker_run for one-shot fire-and-forget fan-out. Summon all clones for a request in ONE shadowclone_summon call."
+				: "Use shadowclone_summon for long-running or parallel work. Summon all clones for a request in ONE shadowclone_summon call.",
 			"By default a shadow clone dispels itself after delivering its final report. Pass keep: true only for clones the user will want to steer with follow-up instructions afterwards.",
 			"Do not pass clone names to shadowclone_summon unless the user explicitly requested specific nicknames; names are auto-picked.",
 			"You are the lead of your summoned shadow clones. When the user mentions @<clone-name>, relay their instructions to that clone with shadowclone_send and confirm to the user.",
 			"Messages starting with 'Shadow clone @<name>' are reports from your clones. A clone that 'asks' is blocked waiting for your answer: reply promptly via shadowclone_send. Verify completed work, and dispel kept clones that are done via shadowclone_dispel.",
 			"A clone that hits a provider failure retries once automatically; if it fails again it pauses with its session intact. Steer it with shadowclone_send (for refusals, affirm the work is on the user's own product), or dispel it to collect memories.",
 			`One-shot clones linger ~${LINGER_MINUTES}m after their final report; shadowclone_send within that window keeps them alive for follow-ups.`,
-			"Clones run in your active git worktree by default; pass worktree: <branch> to place a clone in a different existing worktree (create it first with git worktree add).",
-			"Give a clone a persona only when approach or style matters for its task; keep personas short and situation-specific.",
-			...(settings.modelTiers && settings.cloneModel && settings.workerModel
+			"Clones run in your active git worktree by default; pass worktree: <branch> to place a clone in a different existing worktree (create it first with /worktree <branch>).",
+			...(cloneWorkers
 				? [
-						`Model tiers are active: clones think on the architect model (${settings.cloneModel}); their worker_run workers execute on the cheaper ${settings.workerModel}. Give clones the thinking-heavy, open-ended work and let them delegate mechanical edits to workers to conserve the architect model's usage limits.`,
+						"worker_run BLOCKS its caller for the entire run. To fan work out without freezing yourself, summon a clone whose task is to run the worker_run — it blocks only that clone, in the background, and reports back when the workers are done.",
 					]
 				: []),
-			'You choose each clone\'s model: pass model: "provider/model-id" or the aliases "architect" (smart, for open-ended work) and "executor" (cheap, obedient — fine for long mechanical tasks) per clone in the summon call. Omit it for the default.',
+			"Give a clone a persona only when approach or style matters for its task; keep personas short and situation-specific.",
+			'Model and thinking are yours to choose per clone: pass an exact "provider/model-id" from --list-models and a thinking level when you judge the task needs them. Omitted model inherits yours; omitted thinking defaults to medium.',
+			'Per-clone auth: pass account: "<saved /acc profile>" at summon, or switch a live clone with shadowclone_account — the lead and sibling clones keep their own accounts.',
+			"On a 429/rate-limit error a clone auto-pauses (no retry, no fallback model) with its session intact: switch its account via shadowclone_account (it resumes automatically) or resume later with shadowclone_send. shadowclone_pause pauses a clone manually.",
 			"While clones work the chat stays usable: end your turn and keep working — clone reports arrive as messages that wake you automatically, and the bottom status line tracks live clones. Don't sleep-poll with bash or spin on shadowclone_status; there is nothing to wait on by hand.",
 		],
 		parameters: SummonParamsSchema,
 		prepareArguments(args) {
 			if (!args || typeof args !== "object") return args as SummonParams;
-			const input = args as { clones?: SummonParams["clones"]; task?: unknown; name?: unknown };
+			const input = args as {
+				clones?: SummonParams["clones"];
+				task?: unknown;
+				name?: unknown;
+				keep?: unknown;
+				persona?: unknown;
+				worktree?: unknown;
+				model?: unknown;
+				thinking?: unknown;
+				account?: unknown;
+			};
 			if (input.clones === undefined && typeof input.task === "string") {
+				const thinking = SPAWN_THINKING_LEVELS.find((level) => level === input.thinking);
 				return {
-					clones: [{ task: input.task, ...(typeof input.name === "string" ? { name: input.name } : {}) }],
+					clones: [
+						{
+							task: input.task,
+							...(typeof input.name === "string" ? { name: input.name } : {}),
+							...(typeof input.keep === "boolean" ? { keep: input.keep } : {}),
+							...(typeof input.persona === "string" ? { persona: input.persona } : {}),
+							...(typeof input.worktree === "string" ? { worktree: input.worktree } : {}),
+							...(typeof input.model === "string" ? { model: input.model } : {}),
+							...(thinking ? { thinking } : {}),
+							...(typeof input.account === "string" ? { account: input.account } : {}),
+						},
+					],
 				};
 			}
 			return args as SummonParams;
@@ -2012,7 +2511,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			}
 			const liveSiblings = [...clones.values()].map((c) => ({ name: c.name, task: c.task }));
 			// Resolve each clone's worktree up front so a bad branch fails before any name is reserved.
-			// Default: the lead's active worktree (when a worktree extension provides one), else the repo root.
+			// Default: the lead's active worktree (pi-dev-worktrees), else the repo root.
 			const leadWt = readLeadWorktree(ctx);
 			const defaultCwd = leadWt?.path && existsSync(leadWt.path) ? leadWt.path : ctx.cwd;
 			const defaultLabel = leadWt?.branch ?? gitBranchAt(defaultCwd);
@@ -2024,11 +2523,27 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 				if (!match) {
 					const avail = knownWorktrees.map((w) => w.branch).join(", ") || "none";
 					throw new Error(
-						`No git worktree for branch '${wanted}'. Create it first with \`git worktree add\`. Available worktrees: ${avail}.`,
+						`No git worktree for branch '${wanted}'. Create it first with /worktree ${wanted} (or the worktree tool). Available worktrees: ${avail}.`,
 					);
 				}
 				return { cwd: match.path, worktreeLabel: match.branch };
 			});
+			// Validate the whole batch before reserving names or starting sessions, so one
+			// bad explicit model cannot leave a partially summoned wave behind.
+			const selectedModels = params.clones.map((spec) => resolveSpawnModel(ctx.modelRegistry, spec.model));
+			const selectedThinking = params.clones.map((spec, index) =>
+				resolveSpawnThinkingLevel(selectedModels[index] ?? ctx.model, spec.thinking),
+			);
+			// Validate explicit accounts up front too: an unknown /acc profile must fail
+			// before any name is reserved or session started.
+			for (const [index, spec] of params.clones.entries()) {
+				if (!spec.account) continue;
+				const provider = (selectedModels[index] ?? ctx.model)?.provider;
+				if (!provider) {
+					throw new Error(`Clone ${index + 1}: account "${spec.account}" requires a resolvable model provider.`);
+				}
+				getAccountCredential(provider, spec.account); // throws with the available profiles when unknown
+			}
 			const assignments: CloneSpec[] = params.clones.map((spec, index) => {
 				const name = resolveName(spec.name);
 				reservedNames.add(name);
@@ -2040,7 +2555,9 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 					persona: spec.persona,
 					cwd: placements[index].cwd,
 					worktreeLabel: placements[index].worktreeLabel,
-					model: spec.model,
+					model: selectedModels[index],
+					thinkingLevel: selectedThinking[index],
+					account: spec.account,
 				};
 			});
 			let waveId: number | undefined;
@@ -2067,7 +2584,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 					"",
 					...summons.map(
 						(s) =>
-							`@${s.name}${s.keep ? " (stays for orders)" : ""}${s.worktreeLabel ? ` [worktree: ${s.worktreeLabel}]` : ""} — ${truncateSingleLine(s.task, 140)}\n  watch: tail -f ${s.logPath}`,
+							`@${s.name}${s.keep ? " (stays for orders)" : ""}${s.worktreeLabel ? ` [worktree: ${s.worktreeLabel}]` : ""} [${s.modelSpec ?? "lead model"} · thinking ${s.thinking}${s.account ? ` · acc ${s.account}` : ""}] — ${truncateSingleLine(s.task, 140)}\n  watch: tail -f ${s.logPath}`,
 					),
 					"",
 					"One-shot clones report and dispel themselves; clones marked keep stay alive for shadowclone_send.",
@@ -2182,6 +2699,17 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 			if (targets.length === 0) {
 				return { content: [{ type: "text", text: "No live shadow clones to dispel." }], details: undefined };
 			}
+			const separator = "\n\n";
+			const perTargetBudget = Math.min(
+				CLONE_REPORT_MAX_BYTES,
+				Math.max(
+					1024,
+					Math.floor(
+						(CLONE_REPORT_BATCH_MAX_BYTES - Buffer.byteLength(separator, "utf8") * (targets.length - 1)) /
+							targets.length,
+					),
+				),
+			);
 			const reports = await Promise.all(
 				targets.map(async (clone) => {
 					const wasWorking = clone.session.isStreaming;
@@ -2191,14 +2719,80 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 						wasWorking ? "dispelled by the lead mid-work" : "dispelled by the lead",
 						false,
 					);
-					return `@${clone.name} dispelled${wasWorking ? " (work aborted)" : ""}. Memories returned:\n${memories}`;
+					return truncateCloneReport(
+						`@${clone.name} dispelled${wasWorking ? " (work aborted)" : ""}. Memories returned:\n${memories}`,
+						perTargetBudget,
+					);
 				}),
 			);
-			return { content: [{ type: "text", text: reports.join("\n\n") }], details: undefined };
+			return { content: [{ type: "text", text: reports.join(separator) }], details: undefined };
 		},
 		renderCall(args, theme) {
 			const name = args.name ? ` @${normalizeCloneName(args.name)}` : "";
 			return new Text(theme.fg("toolTitle", theme.bold("shadowclone_dispel")) + theme.fg("accent", name), 0, 0);
+		},
+	});
+
+	pi.registerTool<typeof PauseParamsSchema, undefined>({
+		name: "shadowclone_pause",
+		label: "Shadow Clones: Pause",
+		description:
+			'Temporarily pause a shadow clone by name (or "all"). In-flight work is aborted, but the session and its context stay fully intact and cost nothing while paused. Resume with shadowclone_send (new instructions or just "resume"), or with shadowclone_account to switch its auth account and continue.',
+		promptSnippet: "Temporarily pause a shadow clone (or all); resume later with shadowclone_send.",
+		parameters: PauseParamsSchema,
+		async execute(_toolCallId, params: PauseParams) {
+			const raw = normalizeCloneName(params.name);
+			const targets = raw === "all" ? [...clones.values()] : [lookupClone(raw)];
+			if (targets.length === 0) {
+				return { content: [{ type: "text", text: "No live shadow clones to pause." }], details: undefined };
+			}
+			const lines = targets.map((clone) => {
+				const result = requestClonePause(clone, "lead");
+				return result === "noop"
+					? `@${clone.name}: nothing to pause (${clone.status}).`
+					: `@${clone.name}: paused (session intact). Resume via shadowclone_send.`;
+			});
+			return { content: [{ type: "text", text: lines.join("\n") }], details: undefined };
+		},
+		renderCall(args, theme) {
+			const name = args.name ? ` @${normalizeCloneName(args.name)}` : "";
+			return new Text(theme.fg("toolTitle", theme.bold("shadowclone_pause")) + theme.fg("accent", name), 0, 0);
+		},
+	});
+
+	pi.registerTool<typeof AccountParamsSchema, undefined>({
+		name: "shadowclone_account",
+		label: "Shadow Clones: Switch Account",
+		description:
+			"Switch a live shadow clone to another saved /acc auth profile — per clone: the lead and sibling clones keep their own accounts. Takes effect on the clone's next request; a clone paused by a rate limit or failure resumes automatically. Use this after a rate-limit auto-pause to continue the work on another account.",
+		promptSnippet: "Switch a shadow clone to another saved /acc auth account (per-clone; auto-resumes paused clones).",
+		parameters: AccountParamsSchema,
+		async execute(_toolCallId, params: AccountParams) {
+			const clone = lookupClone(params.name);
+			const provider = clone.model?.provider;
+			if (!provider) throw new Error(`@${clone.name} has no resolved model, so there is no provider to switch the account for.`);
+			await pinCloneAccount(clone.cloneAuth, provider, params.account);
+			clone.account = resolveAccountLabel(clone.cloneAuth, provider) ?? params.account;
+			log(clone, "status", `status: account switched to ${clone.account} (${provider})`);
+			widgetEmitter.flush();
+			if (!clone.session.isStreaming && (clone.status === "paused" || clone.status === "failed")) {
+				runInstruction(clone, RESUME_AFTER_PAUSE_PROMPT);
+				return {
+					content: [{ type: "text", text: `@${clone.name} switched to acc ${clone.account} and resumed its task.` }],
+					details: undefined,
+				};
+			}
+			return {
+				content: [
+					{ type: "text", text: `@${clone.name} switched to acc ${clone.account}; it applies from the clone's next request.` },
+				],
+				details: undefined,
+			};
+		},
+		renderCall(args, theme) {
+			const name = args.name ? ` @${normalizeCloneName(args.name)}` : "";
+			const account = args.account ? theme.fg("dim", ` → acc ${args.account}`) : "";
+			return new Text(theme.fg("toolTitle", theme.bold("shadowclone_account")) + theme.fg("accent", name) + account, 0, 0);
 		},
 	});
 
@@ -2247,8 +2841,28 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 					abort: (clone) => {
 						if (clone.session.isStreaming) {
 							log(clone, "status", "── aborted by user (dashboard)");
+							clone.session.abortCompaction();
 							void clone.session.abort();
 						}
+					},
+					pause: (clone) => {
+						if (clone.status === "paused" || clone.status === "failed") {
+							// Resume: goes through the normal user-send path so the lead sees it.
+							void sendToClone(clone, RESUME_AFTER_PAUSE_PROMPT, "user");
+							return;
+						}
+						if (requestClonePause(clone, "user") === "noop") return;
+						// Quiet nextTurn note (no fresh lead turn): the lead must know this clone
+						// will stay silent until resumed, without burning tokens on the pause itself.
+						pi.sendMessage(
+							{
+								customType: SHADOWCLONE_REPORT_TYPE,
+								content: `Shadow clone @${clone.name} was paused by the user via the dashboard. Its session stays intact; it reports nothing until resumed (shadowclone_send, shadowclone_account, or dashboard p).`,
+								display: true,
+								details: { name: clone.name, kind: "user-pause" },
+							},
+							{ deliverAs: "nextTurn" },
+						);
 					},
 					dispel: async (clone) => {
 						await dispelClone(clone);
@@ -2257,7 +2871,9 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 								pi.sendMessage(
 									{
 										customType: SHADOWCLONE_REPORT_TYPE,
-										content: `Shadow clone @${clone.name} dispelled by the user via the dashboard. Any in-progress work was aborted.\n\nMemories returned:\n${memories}`,
+										content: truncateCloneReport(
+											`Shadow clone @${clone.name} dispelled by the user via the dashboard. Any in-progress work was aborted.\n\nMemories returned:\n${memories}`,
+										),
 										display: true,
 										details: { name: clone.name, kind: "user-dispel" },
 									},
@@ -2266,6 +2882,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 							},
 						);
 					},
+					dispelWorker: (run, agentIndex) => dispelWorkerRun(run.id, agentIndex),
 					done: () => done(undefined),
 					requestRender: () => tui.requestRender(),
 					getSpinnerGlyph: spinnerGlyph,
@@ -2274,14 +2891,17 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 				updateSpinnerTimer(); // switch to the smooth in-dashboard spinner cadence
 				return dashboard;
 			},
-			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },
+			// altScreen: the dashboard owns the terminal's alternate buffer, so the chat
+			// (scrollback, inline images) can neither be scrolled into view nor bleed
+			// through it; the main screen is restored exactly on close.
+			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", altScreen: true } },
 		);
 		dashboardRefresh = undefined;
 		updateSpinnerTimer(); // back to the calm background cadence now the dashboard is closed
 	};
 
 	pi.registerCommand("shadowclones", {
-		description: "Open the shadow clone dashboard (switch, steer, dispel, watch)",
+		description: "Open the agents dashboard (steer/dispel clones, cancel/dismiss workers, watch)",
 		handler: async (_args, ctx) => openDashboard(ctx),
 	});
 
@@ -2299,6 +2919,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 				return;
 			}
 			log(clone, "status", "── simulated crash (/shadowclone-pop)");
+			clone.session.abortCompaction();
 			void clone.session.abort();
 		},
 	});
@@ -2344,6 +2965,9 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 	// with no live agents so an empty-editor Down keeps its normal behavior.
 	pi.registerShortcut("down", {
 		description: "Focus the agents tray; press again (or Enter) to open the dashboard",
+		// Down is a built-in editor key, but the editor only routes it here from an empty
+		// editor, so this override is deliberate; opt out of the startup conflict diagnostic.
+		allowBuiltinOverride: true,
 		handler: async (ctx) => {
 			if (liveAgentCount() === 0) return;
 			if (trayFocused) {
@@ -2359,6 +2983,12 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 		// The lead just finished a run. Flush any buffered clone reports as one consolidated
 		// followUp; _handlePostAgentRun sees the queued message and runs a single continuation
 		// turn, instead of the reports trickling out one lead turn at a time.
+		flushBufferedReports();
+	});
+	pi.on("agent_settled", async () => {
+		// A report can land after the final agent_end while retry/compaction cleanup is
+		// still active. Flush again at the true idle boundary so it cannot remain stuck
+		// until an unrelated future user prompt.
 		flushBufferedReports();
 	});
 
@@ -2428,6 +3058,7 @@ export function registerShadowClones(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		unsubscribeWorkerRuns();
 		if (spinnerTimer) {
 			clearInterval(spinnerTimer);
 			spinnerTimer = undefined;

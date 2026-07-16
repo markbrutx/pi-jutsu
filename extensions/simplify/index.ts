@@ -1,25 +1,73 @@
-import { statSync } from "node:fs";
-import { homedir } from "node:os";
+/**
+ * /simplify — changed-code review and cleanup with a configurable review council.
+ *
+ * Phase 1 identifies the change set (git diff + untracked files, with a
+ * recent-files fallback), Phase 2 fans it out to parallel read-only review
+ * subagents (the "council"), Phase 3 lets the lead fix aggregated findings.
+ *
+ * The council is configured in <agentDir>/simplify-settings.json:
+ *
+ *   {
+ *     "council": [
+ *       { "id": "review-a", "model": "provider-a/model-a" },
+ *       { "id": "review-b", "model": "provider-b/model-b" }
+ *     ]
+ *   }
+ *
+ * Member fields: id (display name), aspect ("reuse" | "quality" |
+ * "efficiency" | "full"; default "full"), instruction (custom review brief,
+ * overrides aspect), model (an exact "provider/model-id" from --list-models;
+ * unknown or unauthenticated selections fail explicitly). Missing or invalid
+ * config = the classic reuse/quality/efficiency trio on the lead's model. Runs
+ * are published to the swarm worker-run registry, so the council is visible in
+ * the clone dashboard while it reviews.
+ *
+ * When no simplify-settings.json exists, /simplify first opens a fullscreen
+ * council picker (alt-screen, like the agents dashboard) to assign a model to
+ * each of the three roles; the choice is saved and skipped on later runs.
+ * /simplify-council reopens the picker to reconfigure. The picker has an idle
+ * timeout: if the user is away it closes without saving and the review
+ * proceeds with the current defaults, so the command never blocks forever.
+ */
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { StringEnum, type Api, type Model } from "@earendil-works/pi-ai";
 import {
 	createAgentSession,
-	DefaultResourceLoader,
 	formatSize,
 	getAgentDir,
 	getMarkdownTheme,
+	resolveReadPath,
 	SessionManager,
 	truncateHead,
 	type AgentSession,
-	type AgentSessionEvent,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	type ExecResult,
+	type ResourceLoader,
 	type Theme,
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, matchesKey, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import type { SwarmDetails } from "../swarm/index.ts";
+import { finishWorkerRun, startWorkerRun, updateWorkerRun } from "../swarm/registry.ts";
+import {
+	createLinkedAbortControllers,
+	createSubagentLoader,
+	createThrottledEmitter,
+	formatDisplayItem,
+	formatModelSpec,
+	getEventUpdate,
+	getModelTransition,
+	resolveAccountLabel,
+	resolveSpawnModel,
+	resolveSpawnThinkingLevel,
+	SPAWN_THINKING_LEVELS,
+	truncateSingleLine,
+	type SwarmDisplayItem,
+} from "../swarm/shared.ts";
 
 export const SIMPLIFY_COMMAND_DESCRIPTION =
 	"Review changed code for reuse, quality, and efficiency, then fix any issues found.";
@@ -32,6 +80,17 @@ const MAX_SINGLE_UNTRACKED_DIFF_BYTES = 40 * 1024;
 const UNTRACKED_DIFF_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 3;
 const PROGRESS_EMIT_THROTTLE_MS = 100;
+const MAX_COUNCIL = 6;
+const SIMPLIFY_SETTINGS_FILE = "simplify-settings.json";
+const COUNCIL_PICKER_TIMEOUT_MS = 120_000;
+
+/** Models offered in the council picker, besides "lead" (the current model). */
+const COUNCIL_MODEL_SHORTLIST = [
+	"anthropic/claude-fable-5",
+	"anthropic/claude-opus-4-8",
+	"openai-codex/gpt-5.6-sol",
+	"openai-codex/gpt-5.6-terra",
+] as const;
 
 export const SUBAGENT_SYSTEM_PROMPT = `You are a focused /simplify review subagent.
 
@@ -40,18 +99,38 @@ Return concise, actionable findings with file paths and suggested fixes. If ther
 
 const SimplifyReviewParamsSchema = Type.Object({
 	focus: Type.Optional(Type.String({ description: "Optional extra focus for the simplify review." })),
+	thinking: Type.Optional(
+		StringEnum(SPAWN_THINKING_LEVELS, {
+			description: "Thinking level for the council members. Omit for the default, medium.",
+		}),
+	),
 });
 
 type SimplifyReviewParams = Static<typeof SimplifyReviewParamsSchema>;
 
-export type ReviewAgentId = "reuse" | "quality" | "efficiency";
+export type ReviewAspect = "reuse" | "quality" | "efficiency" | "full";
 export type ReviewStatus = "pending" | "running" | "done" | "failed";
 export type SimplifyReviewPhase = "identifying_changes" | "reviewing" | "done" | "failed";
 
+/** A configured council member (see the module doc for simplify-settings.json). */
+export interface CouncilMember {
+	id: string;
+	aspect: ReviewAspect;
+	instruction?: string;
+	model?: string;
+}
+
+/** A council member resolved against the model registry, ready to run. */
 export interface ReviewAgentSpec {
-	id: ReviewAgentId;
+	id: string;
 	title: string;
 	instruction: string;
+	/** Resolved model override; undefined = the lead's model. */
+	model?: Model<Api>;
+	/** "provider/model-id" the member actually runs on, for display. */
+	modelSpec?: string;
+	/** /acc account profile of the member's provider auth, when known. */
+	account?: string;
 }
 
 export type ChangeContext =
@@ -67,21 +146,22 @@ export type ChangeContext =
 			diffError?: string;
 	  };
 
-export type SimplifyDisplayItem =
-	| { type: "thinking"; text: string }
-	| { type: "tool"; name: string; args: Record<string, unknown> };
+export type SimplifyDisplayItem = SwarmDisplayItem;
 
 export type SimplifyReviewContextSummary =
 	| { kind: "diff"; diffCommand: string; diffLines: number }
 	| { kind: "fallback"; diffCommand: string; recentFiles: string[]; diffError?: string };
 
 export interface ReviewAgentProgress {
-	id: ReviewAgentId;
+	id: string;
 	title: string;
+	/** "provider/model-id" this member runs on, for display. */
+	model?: string;
+	/** /acc account profile of the member's provider auth, when known. */
+	account?: string;
 	status: ReviewStatus;
 	lastActivity: string;
 	output: string;
-	stderr: string;
 	items: SimplifyDisplayItem[];
 	exitCode?: number;
 	stopReason?: string;
@@ -101,7 +181,6 @@ export interface ReviewAgentResult {
 	spec: ReviewAgentSpec;
 	exitCode: number;
 	output: string;
-	stderr: string;
 	items: SimplifyDisplayItem[];
 	stopReason?: string;
 	errorMessage?: string;
@@ -128,20 +207,13 @@ export interface UntrackedFileDiffTruncation {
 	maxLines: number;
 }
 
-export const REVIEW_AGENT_SPECS: readonly ReviewAgentSpec[] = [
-	{
-		id: "reuse",
-		title: "Code Reuse Review",
-		instruction: `For each change:
+const REUSE_INSTRUCTION = `For each change:
 
 1. Search for existing utilities and helpers that could replace newly written code. Look for similar patterns elsewhere in the codebase, especially utility directories, shared modules, and files adjacent to the changed files.
 2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.
-3. Flag inline logic that could use an existing utility, including hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns.`,
-	},
-	{
-		id: "quality",
-		title: "Code Quality Review",
-		instruction: `Review the same changes for hacky patterns:
+3. Flag inline logic that could use an existing utility, including hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns.`;
+
+const QUALITY_INSTRUCTION = `Review the same changes for hacky patterns:
 
 1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls.
 2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones.
@@ -149,12 +221,9 @@ export const REVIEW_AGENT_SPECS: readonly ReviewAgentSpec[] = [
 4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries.
 5. Stringly-typed code: raw strings where constants, string unions, branded types, or existing enums already exist.
 6. Unnecessary UI nesting: wrappers/elements that add no layout value when inner component props already provide the behavior.
-7. Unnecessary comments: comments explaining WHAT the code does, narrating the change, or referencing the task/caller. Keep only non-obvious WHY.`,
-	},
-	{
-		id: "efficiency",
-		title: "Efficiency Review",
-		instruction: `Review the same changes for efficiency:
+7. Unnecessary comments: comments explaining WHAT the code does, narrating the change, or referencing the task/caller. Keep only non-obvious WHY.`;
+
+const EFFICIENCY_INSTRUCTION = `Review the same changes for efficiency:
 
 1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, or N+1 patterns.
 2. Missed concurrency: independent operations run sequentially when they could run in parallel.
@@ -162,9 +231,143 @@ export const REVIEW_AGENT_SPECS: readonly ReviewAgentSpec[] = [
 4. Recurring no-op updates: unconditional state/store updates inside polling loops, intervals, or event handlers. Add change-detection guards when needed.
 5. Unnecessary existence checks: pre-checking file/resource existence before operating when direct operation plus error handling is safer.
 6. Memory: unbounded data structures, missing cleanup, or event listener leaks.
-7. Overly broad operations: reading whole files when only a portion is needed, or loading all items when filtering for one.`,
-	},
+7. Overly broad operations: reading whole files when only a portion is needed, or loading all items when filtering for one.`;
+
+const ASPECT_TITLES: Record<ReviewAspect, string> = {
+	reuse: "Code Reuse Review",
+	quality: "Code Quality Review",
+	efficiency: "Efficiency Review",
+	full: "Full Review",
+};
+
+const ASPECT_INSTRUCTIONS: Record<ReviewAspect, string> = {
+	reuse: REUSE_INSTRUCTION,
+	quality: QUALITY_INSTRUCTION,
+	efficiency: EFFICIENCY_INSTRUCTION,
+	full: `Review the changes for ALL of the following concerns.
+
+### Code reuse
+
+${REUSE_INSTRUCTION}
+
+### Code quality
+
+${QUALITY_INSTRUCTION}
+
+### Efficiency
+
+${EFFICIENCY_INSTRUCTION}`,
+};
+
+export const DEFAULT_COUNCIL: readonly CouncilMember[] = [
+	{ id: "reuse", aspect: "reuse" },
+	{ id: "quality", aspect: "quality" },
+	{ id: "efficiency", aspect: "efficiency" },
 ];
+
+/** Coerce arbitrary JSON into a council; anything unusable falls back to the default trio. */
+export function parseCouncil(raw: unknown): CouncilMember[] {
+	if (!isRecord(raw) || !Array.isArray(raw.council)) return [...DEFAULT_COUNCIL];
+	const members: CouncilMember[] = [];
+	const seen = new Set<string>();
+	for (const entry of raw.council.slice(0, MAX_COUNCIL)) {
+		if (!isRecord(entry)) continue;
+		const aspect: ReviewAspect =
+			entry.aspect === "reuse" || entry.aspect === "quality" || entry.aspect === "efficiency" ? entry.aspect : "full";
+		const instruction =
+			typeof entry.instruction === "string" && entry.instruction.trim() ? entry.instruction.trim() : undefined;
+		const model = typeof entry.model === "string" && entry.model.trim() ? entry.model.trim() : undefined;
+		const base = typeof entry.id === "string" && entry.id.trim() ? entry.id.trim() : aspect;
+		let id = base;
+		for (let n = 2; seen.has(id); n++) id = `${base}-${n}`;
+		seen.add(id);
+		members.push({ id, aspect, instruction, model });
+	}
+	return members.length > 0 ? members : [...DEFAULT_COUNCIL];
+}
+
+function councilSettingsPath(): string {
+	return path.join(getAgentDir(), SIMPLIFY_SETTINGS_FILE);
+}
+
+/** Parsed council from simplify-settings.json, or undefined when the file is missing or invalid. */
+function loadCouncilSettings(): CouncilMember[] | undefined {
+	try {
+		return parseCouncil(JSON.parse(readFileSync(councilSettingsPath(), "utf8")));
+	} catch {
+		return undefined;
+	}
+}
+
+function readCouncil(): CouncilMember[] {
+	return loadCouncilSettings() ?? [...DEFAULT_COUNCIL];
+}
+
+function memberTitle(member: CouncilMember): string {
+	if (member.instruction) return member.id;
+	const aspectTitle = ASPECT_TITLES[member.aspect];
+	if (member.id.toLowerCase() === member.aspect) return aspectTitle;
+	return `${member.id} · ${aspectTitle}`;
+}
+
+/** Resolve a council member to its display title and review instruction (no registry access). */
+export function memberSpec(member: CouncilMember): ReviewAgentSpec {
+	return {
+		id: member.id,
+		title: memberTitle(member),
+		instruction: member.instruction ?? ASPECT_INSTRUCTIONS[member.aspect],
+	};
+}
+
+/** Resolve the configured council against the registry: per-member models, display specs, /acc labels. */
+function resolveCouncil(ctx: ExtensionContext): ReviewAgentSpec[] {
+	// resolveAccountLabel re-reads the catalog file on every call; members usually share a provider.
+	const accountLabels = new Map<string, string | undefined>();
+	const accountLabel = (provider: string): string | undefined => {
+		if (!accountLabels.has(provider)) {
+			accountLabels.set(provider, resolveAccountLabel(ctx.modelRegistry.authStorage, provider));
+		}
+		return accountLabels.get(provider);
+	};
+	return readCouncil().map((member) => {
+		const override = resolveSpawnModel(ctx.modelRegistry, member.model);
+		const model = override ?? ctx.model;
+		return {
+			...memberSpec(member),
+			model: override,
+			modelSpec: formatModelSpec(model),
+			account: model ? accountLabel(model.provider) : undefined,
+		};
+	});
+}
+
+/** Map review details onto the worker-run shape so the clone dashboard can show the council. */
+export function toSwarmDetails(details: SimplifyReviewDetails): SwarmDetails {
+	return {
+		phase:
+			details.phase === "identifying_changes"
+				? "preparing"
+				: details.phase === "reviewing"
+					? "executing"
+					: details.phase,
+		focus: details.focus,
+		agents: details.agents.map((agent, index) => ({
+			index,
+			title: agent.title,
+			model: agent.model,
+			account: agent.account,
+			status: agent.status,
+			lastActivity: agent.lastActivity,
+			output: agent.output,
+			items: agent.items.map(cloneDisplayItem),
+			exitCode: agent.exitCode,
+			stopReason: agent.stopReason,
+			errorMessage: agent.errorMessage,
+		})),
+		startedAt: details.startedAt,
+		updatedAt: details.updatedAt,
+	};
+}
 
 interface RawUntrackedFileDiff {
 	path: string;
@@ -176,13 +379,9 @@ interface RunReviewAgentOptions {
 	spec: ReviewAgentSpec;
 	task: string;
 	thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>;
+	resourceLoader: ResourceLoader;
 	signal: AbortSignal | undefined;
 	onProgress: ReviewProgressCallback;
-}
-
-interface ThrottledEmitter {
-	schedule(): void;
-	flush(): void;
 }
 
 type ReviewProgressPatch = Partial<Omit<ReviewAgentProgress, "id" | "title">>;
@@ -200,7 +399,7 @@ export function buildSimplifyCommandPrompt(focus: string): string {
 
 Call the \`simplify_review\` tool exactly once${focusText ? " with the additional focus below" : ""}. Wait for it to finish. Then fix concrete findings directly in the working tree.
 
-Do not run separate review agents manually; the tool handles Phase 1 and Phase 2 and streams the three subagents in the UI.
+Do not run separate review agents manually; the tool handles Phase 1 and Phase 2 and streams the review council subagents in the UI.
 
 After the tool returns:
 - fix actionable findings directly;
@@ -239,13 +438,17 @@ export function buildChangeContext(
 	};
 }
 
-export function buildReviewTask(spec: ReviewAgentSpec, context: ChangeContext, focus: string): string {
+export function buildReviewTask(spec: ReviewAgentSpec, context: ChangeContext, focus: string, total: number): string {
 	const focusText = focus.trim();
 	const focusSection = focusText ? `\n\n## Additional Focus\n\n${focusText}` : "";
+	const role =
+		total === 1
+			? "You are the isolated review agent for /simplify."
+			: `You are council member "${spec.id}", one of ${total} isolated review agents for /simplify.`;
 
 	return `# Simplify Review: ${spec.title}
 
-You are one of three isolated review agents for /simplify. Review the complete change set below for your assigned concern and return concise findings only.
+${role} Review the complete change set below for your assigned concern and return concise findings only.
 
 Do not modify files. Use tools only to inspect existing code when needed. For each finding, include:
 - the affected file/path;
@@ -279,25 +482,34 @@ ${findings || "No review findings were returned."}
 
 ## Phase 3: Fix Issues
 
-- Read files as needed, then apply direct edits for actionable findings.
+${
+		options.results.length > 1
+			? "- Findings from different council members may overlap; deduplicate and fix each issue once.\n"
+			: ""
+	}- Read files as needed, then apply direct edits for actionable findings.
 - If a finding is a false positive or not worth changing, skip it and note why in the final summary.
 - If all reviews say "No findings" and you do not identify a clear issue, do not edit files; briefly confirm the code is already clean.
 - Keep the final response concise: summarize what was fixed, or confirm no changes were needed.`;
 }
 
-export function createReviewDetails(context: ChangeContext | undefined, focus: string): SimplifyReviewDetails {
+export function createReviewDetails(
+	context: ChangeContext | undefined,
+	focus: string,
+	specs: readonly ReviewAgentSpec[],
+): SimplifyReviewDetails {
 	const now = Date.now();
 	return {
 		phase: context ? "reviewing" : "identifying_changes",
 		focus: focus.trim(),
 		context: context ? summarizeChangeContext(context) : undefined,
-		agents: REVIEW_AGENT_SPECS.map((spec) => ({
+		agents: specs.map((spec) => ({
 			id: spec.id,
 			title: spec.title,
+			model: spec.modelSpec,
+			account: spec.account,
 			status: "pending",
 			lastActivity: "waiting",
 			output: "",
-			stderr: "",
 			items: [],
 		})),
 		startedAt: now,
@@ -312,7 +524,7 @@ export function summarizeReviewDetails(details: SimplifyReviewDetails): string {
 	}
 	for (const agent of details.agents) {
 		const activity = agent.lastActivity ? ` - ${agent.lastActivity}` : "";
-		lines.push(`[${formatStatus(agent.status)}] ${agent.title}${activity}`);
+		lines.push(`[${formatStatus(agent.status)}] ${agent.title}${formatAgentAttribution(agent)}${activity}`);
 	}
 	return lines.join("\n");
 }
@@ -476,19 +688,18 @@ function formatReviewResult(result: ReviewAgentResult): string {
 	if (result.exitCode !== 0) diagnostics.push(`Subagent exited with code ${result.exitCode}.`);
 	if (result.stopReason) diagnostics.push(`Stop reason: ${result.stopReason}.`);
 	if (result.errorMessage) diagnostics.push(`Error: ${result.errorMessage}`);
-	if (result.stderr.trim()) diagnostics.push(`stderr:\n\`\`\`\n${result.stderr.trim()}\n\`\`\``);
 
 	const diagnosticsText = diagnostics.length > 0 ? `${diagnostics.join("\n\n")}\n\n` : "";
 	const output = result.output.trim() || "No findings.";
-	return `### ${result.spec.title}\n\n${diagnosticsText}${output}`;
+	const attribution = result.spec.modelSpec ? ` (${result.spec.modelSpec})` : "";
+	return `### ${result.spec.title}${attribution}\n\n${diagnosticsText}${output}`;
 }
 
 async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAgentResult> {
-	const { ctx, spec, task, thinkingLevel, signal, onProgress } = options;
+	const { ctx, spec, task, thinkingLevel, resourceLoader, signal, onProgress } = options;
 	let session: AgentSession | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let lastAssistantText = "";
-	let stderr = "";
 	let stopReason: string | undefined;
 	let errorMessage: string | undefined;
 	let wasAborted = signal?.aborted ?? false;
@@ -498,7 +709,6 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 		onProgress({
 			status: "running",
 			output: lastAssistantText,
-			stderr,
 			stopReason,
 			errorMessage,
 			...patch,
@@ -517,7 +727,6 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 			spec,
 			exitCode: 1,
 			output: "",
-			stderr: "",
 			items: [],
 			stopReason: "aborted",
 		};
@@ -527,32 +736,10 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 		signal?.addEventListener("abort", abort, { once: true });
 		publish({ lastActivity: "starting" });
 
-		const agentDir = getAgentDir();
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: ctx.cwd,
-			agentDir,
-			appendSystemPrompt: [SUBAGENT_SYSTEM_PROMPT],
-			noExtensions: true,
-			noPromptTemplates: true,
-			noThemes: true,
-		});
-		await resourceLoader.reload();
-		if (wasAborted) {
-			return {
-				spec,
-				exitCode: 1,
-				output: lastAssistantText,
-				stderr,
-				items: [...items],
-				stopReason: "aborted",
-				errorMessage,
-			};
-		}
-
 		const created = await createAgentSession({
 			cwd: ctx.cwd,
-			agentDir,
-			model: ctx.model,
+			agentDir: getAgentDir(),
+			model: spec.model ?? ctx.model,
 			modelRegistry: ctx.modelRegistry,
 			thinkingLevel,
 			tools: [...REVIEW_TOOL_NAMES],
@@ -565,7 +752,6 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 				spec,
 				exitCode: 1,
 				output: lastAssistantText,
-				stderr,
 				items: [...items],
 				stopReason: "aborted",
 				errorMessage,
@@ -573,7 +759,16 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 		}
 
 		unsubscribe = session.subscribe((event) => {
-			const update = getReviewEventUpdate(event, items);
+			const transition = getModelTransition(event);
+			if (transition) {
+				publish({
+					model: formatModelSpec(transition.model),
+					account: resolveAccountLabel(ctx.modelRegistry.authStorage, transition.model.provider),
+					lastActivity: transition.activity,
+				});
+				return;
+			}
+			const update = getEventUpdate(event, items);
 			if (!update) return;
 			if (update.output !== undefined) lastAssistantText = update.output;
 			if (update.stopReason !== undefined) stopReason = update.stopReason;
@@ -587,7 +782,6 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 			spec,
 			exitCode: failed ? 1 : 0,
 			output: lastAssistantText,
-			stderr,
 			items: [...items],
 			stopReason: wasAborted ? "aborted" : stopReason,
 			errorMessage,
@@ -598,7 +792,6 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 			spec,
 			exitCode: 1,
 			output: lastAssistantText,
-			stderr,
 			items: [...items],
 			stopReason: wasAborted ? "aborted" : "error",
 			errorMessage,
@@ -608,95 +801,6 @@ async function runReviewAgent(options: RunReviewAgentOptions): Promise<ReviewAge
 		unsubscribe?.();
 		session?.dispose();
 	}
-}
-
-interface ReviewEventUpdate {
-	output?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	lastActivity?: string;
-}
-
-function getReviewEventUpdate(
-	event: AgentSessionEvent,
-	items: SimplifyDisplayItem[],
-): ReviewEventUpdate | undefined {
-	switch (event.type) {
-		case "agent_start":
-			return { lastActivity: "started" };
-		case "agent_end":
-			return { lastActivity: "completed" };
-		case "message_update":
-			if (event.message.role !== "assistant") return undefined;
-			return getAssistantReviewUpdate(event.message);
-		case "message_end":
-			if (event.message.role !== "assistant") return undefined;
-			return getFinalAssistantReviewUpdate(event.message, items);
-		case "tool_execution_start": {
-			const args = isRecord(event.args) ? event.args : {};
-			items.push({ type: "tool", name: event.toolName, args });
-			return { lastActivity: formatToolActivity(event.toolName, args) };
-		}
-		case "tool_execution_update":
-			return { lastActivity: `${event.toolName} running` };
-		case "tool_execution_end":
-			return { lastActivity: `${event.toolName} finished` };
-		default:
-			return undefined;
-	}
-}
-
-function getAssistantReviewUpdate(message: unknown): ReviewEventUpdate {
-	const text = extractAssistantText(message);
-	const thinking = extractAssistantThinking(message);
-	return {
-		output: text,
-		lastActivity: formatAssistantActivity(text, thinking),
-	};
-}
-
-function getFinalAssistantReviewUpdate(message: unknown, items: SimplifyDisplayItem[]): ReviewEventUpdate {
-	const text = extractAssistantText(message);
-	const thinking = extractAssistantThinking(message);
-	if (thinking) items.push({ type: "thinking", text: thinking });
-	return {
-		output: text,
-		stopReason: getStringProperty(message, "stopReason"),
-		errorMessage: getStringProperty(message, "errorMessage"),
-		lastActivity: formatAssistantActivity(text, thinking),
-	};
-}
-
-function extractAssistantText(message: unknown): string {
-	return extractAssistantContent(message, "text", "text");
-}
-
-function extractAssistantThinking(message: unknown): string {
-	return extractAssistantContent(message, "thinking", "thinking");
-}
-
-function extractAssistantContent(message: unknown, type: string, field: string): string {
-	if (!isRecord(message) || !Array.isArray(message.content)) return "";
-	const parts: string[] = [];
-	for (const part of message.content) {
-		if (isRecord(part) && part.type === type) {
-			const value = part[field];
-			if (typeof value === "string") parts.push(value);
-		}
-	}
-	return parts.join("\n").trim();
-}
-
-function getStringProperty(value: unknown, key: string): string | undefined {
-	if (!isRecord(value)) return undefined;
-	const property = value[key];
-	return typeof property === "string" ? property : undefined;
-}
-
-function formatAssistantActivity(text: string, thinking: string): string {
-	if (thinking) return `thinking: ${truncateSingleLine(thinking, 80)}`;
-	if (text) return `writing findings: ${truncateSingleLine(text, 80)}`;
-	return "working";
 }
 
 function summarizeChangeContext(context: ChangeContext): SimplifyReviewContextSummary {
@@ -737,38 +841,11 @@ function cloneDisplayItem(item: SimplifyDisplayItem): SimplifyDisplayItem {
 	return { ...item };
 }
 
-function updateAgent(details: SimplifyReviewDetails, id: ReviewAgentId, patch: ReviewProgressPatch): void {
+function updateAgent(details: SimplifyReviewDetails, id: string, patch: ReviewProgressPatch): void {
 	const agent = details.agents.find((candidate) => candidate.id === id);
 	if (!agent) return;
 	Object.assign(agent, patch);
 	details.updatedAt = Date.now();
-}
-
-function createThrottledEmitter(callback: () => void, intervalMs: number): ThrottledEmitter {
-	let timeout: ReturnType<typeof setTimeout> | undefined;
-	let lastEmitAt = 0;
-
-	const emitNow = () => {
-		if (timeout) {
-			clearTimeout(timeout);
-			timeout = undefined;
-		}
-		lastEmitAt = Date.now();
-		callback();
-	};
-
-	return {
-		schedule() {
-			const now = Date.now();
-			const waitMs = Math.max(0, intervalMs - (now - lastEmitAt));
-			if (waitMs === 0) {
-				emitNow();
-				return;
-			}
-			if (!timeout) timeout = setTimeout(emitNow, waitMs);
-		},
-		flush: emitNow,
-	};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -827,8 +904,7 @@ function normalizeCandidatePath(candidate: string, cwd: string): string | undefi
 	value = value.replace(/:\d+(?::\d+)?$/g, "");
 	if (!value || value.includes("://") || value.startsWith("node:")) return undefined;
 
-	const expanded = value === "~" || value.startsWith("~/") ? path.join(homedir(), value.slice(1)) : value;
-	const absolute = path.resolve(cwd, expanded);
+	const absolute = resolveReadPath(value, cwd);
 	try {
 		if (!statSync(absolute).isFile()) return undefined;
 	} catch {
@@ -853,6 +929,180 @@ function uniqueStrings(values: readonly string[]): string[] {
 
 function escapeAttribute(value: string): string {
 	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ─────────────────────────────────────────────
+// Fullscreen council picker (alt-screen, like the agents dashboard)
+// ─────────────────────────────────────────────
+
+/** Shortlist entries that resolve to an authenticated model; undefined = lead's model. */
+function councilModelChoices(ctx: ExtensionContext): (string | undefined)[] {
+	const choices: (string | undefined)[] = [undefined];
+	for (const spec of COUNCIL_MODEL_SHORTLIST) {
+		try {
+			if (resolveSpawnModel(ctx.modelRegistry, spec)) choices.push(spec);
+		} catch {
+			// unknown or unauthenticated — leave it out of the picker
+		}
+	}
+	return choices;
+}
+
+function formatPickerCountdown(ms: number): string {
+	const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+	return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, "0")}`;
+}
+
+interface CouncilPickerOptions {
+	theme: Theme;
+	/** Council members whose models are being assigned; metadata is preserved on save. */
+	members: readonly CouncilMember[];
+	choices: readonly (string | undefined)[];
+	leadModel?: string;
+	getHeight: () => number;
+	requestRender: () => void;
+	/** Chosen model spec per role on save; undefined = cancelled or timed out (no save). */
+	done: (models: (string | undefined)[] | undefined) => void;
+}
+
+class CouncilPicker {
+	focused = false;
+
+	private readonly options: CouncilPickerOptions;
+	private readonly selection: number[];
+	private row = 0;
+	private deadline = Date.now() + COUNCIL_PICKER_TIMEOUT_MS;
+	private timer: ReturnType<typeof setInterval> | undefined;
+
+	constructor(options: CouncilPickerOptions) {
+		this.options = options;
+		// Seed each row from the member's saved model (0 = lead when absent/unknown).
+		this.selection = options.members.map((member) => Math.max(0, options.choices.indexOf(member.model)));
+		// Idle timeout: if the user is away, close without saving so /simplify
+		// continues with the current defaults instead of blocking forever.
+		this.timer = setInterval(() => {
+			if (Date.now() >= this.deadline) {
+				this.dispose();
+				this.options.done(undefined);
+				return;
+			}
+			this.options.requestRender();
+		}, 1000);
+	}
+
+	private choiceLabel(index: number): string {
+		const spec = this.options.choices[index];
+		if (spec) return spec;
+		return this.options.leadModel ? `lead (${this.options.leadModel})` : "lead (current model)";
+	}
+
+	handleInput(data: string): void {
+		this.deadline = Date.now() + COUNCIL_PICKER_TIMEOUT_MS;
+		const roleCount = this.options.members.length;
+		const choiceCount = this.options.choices.length;
+
+		if (matchesKey(data, "escape")) {
+			this.dispose();
+			this.options.done(undefined);
+			return;
+		}
+		if (matchesKey(data, "return")) {
+			this.dispose();
+			this.options.done(this.selection.map((index) => this.options.choices[index]));
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			this.row = (this.row + roleCount - 1) % roleCount;
+		} else if (matchesKey(data, "down") || matchesKey(data, "tab")) {
+			this.row = (this.row + 1) % roleCount;
+		} else if (matchesKey(data, "left")) {
+			this.selection[this.row] = (this.selection[this.row]! + choiceCount - 1) % choiceCount;
+		} else if (matchesKey(data, "right") || data === " ") {
+			this.selection[this.row] = (this.selection[this.row]! + 1) % choiceCount;
+		} else {
+			return;
+		}
+		this.options.requestRender();
+	}
+
+	render(width: number): string[] {
+		const theme = this.options.theme;
+		const height = Math.max(10, this.options.getHeight());
+		const lines: string[] = [];
+		const bar = (content: string) => truncateToWidth(content, width, "...", true);
+
+		lines.push(bar(` ${theme.bold(theme.fg("warning", "/simplify"))}  ${theme.fg("muted", "council setup")}`));
+		lines.push(bar(theme.fg("border", "─".repeat(width))));
+		lines.push(bar(""));
+		lines.push(bar(` ${theme.fg("text", "Assign a model to each review role. Saved to simplify-settings.json.")}`));
+		lines.push(bar(""));
+
+		const titles = this.options.members.map(memberTitle);
+		const titleWidth = Math.max(24, ...titles.map((title) => title.length));
+		for (let i = 0; i < titles.length; i++) {
+			const title = titles[i]!.padEnd(titleWidth);
+			const choice = ` ◂ ${this.choiceLabel(this.selection[i]!)} ▸ `;
+			const rowText = ` ${title} ${i === this.row ? theme.bg("selectedBg", theme.bold(theme.fg("accent", choice))) : theme.fg("dim", choice)}`;
+			lines.push(bar(`${i === this.row ? theme.fg("accent", " ▶") : "  "}${rowText}`));
+		}
+
+		while (lines.length < height - 2) lines.push(bar(""));
+		lines.push(bar(theme.fg("border", "─".repeat(width))));
+		const remaining = this.deadline - Date.now();
+		const countdown = theme.fg(remaining < 30_000 ? "warning" : "dim", `⏱ auto-skip ${formatPickerCountdown(remaining)}`);
+		lines.push(bar(theme.fg("dim", ` ↑↓ role · ←→ model · ⏎ save · esc skip · `) + countdown));
+		return lines.slice(0, height);
+	}
+
+	invalidate(): void {}
+
+	dispose(): void {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = undefined;
+		}
+	}
+}
+
+/**
+ * Open the fullscreen picker and persist the council on save. Assigns models to
+ * the SAVED council members (preserving custom ids, aspects, and instructions);
+ * without saved settings it configures the default reuse/quality/efficiency trio.
+ * Returns true if saved.
+ */
+async function configureCouncil(ctx: ExtensionCommandContext, saved: CouncilMember[] | undefined): Promise<boolean> {
+	if (ctx.mode !== "tui") return false;
+	const members = saved ?? [...DEFAULT_COUNCIL];
+	const choices = councilModelChoices(ctx);
+	const models = await ctx.ui.custom<(string | undefined)[] | undefined>(
+		(tui, theme, _kb, done) =>
+			new CouncilPicker({
+				theme,
+				members,
+				choices,
+				leadModel: formatModelSpec(ctx.model),
+				getHeight: () => tui.terminal.rows,
+				requestRender: () => tui.requestRender(),
+				done,
+			}),
+		// altScreen: the picker owns the terminal's alternate buffer, so the chat
+		// behind never repaints or jumps (same as the agents dashboard).
+		{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", altScreen: true } },
+	);
+	if (!models) return false;
+
+	const council = members.map((member, index) => ({
+		id: member.id,
+		aspect: member.aspect,
+		...(member.instruction ? { instruction: member.instruction } : {}),
+		...(models[index] ? { model: models[index] } : {}),
+	}));
+	writeFileSync(councilSettingsPath(), `${JSON.stringify({ council }, null, "\t")}\n`);
+	ctx.ui.notify(
+		`Simplify council saved: ${council.map((member) => `${member.id}=${member.model ?? "lead"}`).join(", ")}`,
+		"info",
+	);
+	return true;
 }
 
 function queueInstructionMessage(pi: ExtensionAPI, ctx: ExtensionCommandContext, prompt: string): void {
@@ -898,38 +1148,11 @@ function formatContextSummary(context: SimplifyReviewContextSummary): string {
 	return `change set: no diff from ${context.diffCommand}, fallback to ${files}`;
 }
 
-function formatToolActivity(toolName: string, args: Record<string, unknown>): string {
-	if (toolName === "bash") {
-		const command = getStringArg(args, "command") ?? "command";
-		return `$ ${truncateSingleLine(command, 80)}`;
-	}
-	if (toolName === "read") {
-		return `read ${getPathArg(args) ?? "file"}`;
-	}
-	if (toolName === "grep") {
-		const pattern = getStringArg(args, "pattern") ?? "pattern";
-		return `grep ${truncateSingleLine(pattern, 60)}`;
-	}
-	if (toolName === "find") {
-		const pattern = getStringArg(args, "pattern") ?? "*";
-		return `find ${truncateSingleLine(pattern, 60)}`;
-	}
-	return toolName;
-}
-
-function getPathArg(args: Record<string, unknown>): string | undefined {
-	return getStringArg(args, "path") ?? getStringArg(args, "file_path") ?? getStringArg(args, "filePath");
-}
-
-function getStringArg(args: Record<string, unknown>, key: string): string | undefined {
-	const value = args[key];
-	return typeof value === "string" ? value : undefined;
-}
-
-function truncateSingleLine(value: string, maxLength: number): string {
-	const line = value.replace(/\s+/g, " ").trim();
-	if (line.length <= maxLength) return line;
-	return `${line.slice(0, Math.max(0, maxLength - 3))}...`;
+/** "model · acc" attribution for a council member: themed bracket form for the TUI, plain parens for text. */
+function formatAgentAttribution(agent: ReviewAgentProgress, theme?: Theme): string {
+	if (!agent.model) return "";
+	const label = `${agent.model}${agent.account ? ` · acc: ${agent.account}` : ""}`;
+	return theme ? theme.fg("dim", ` [${label}]`) : ` (${label})`;
 }
 
 function renderStatus(status: ReviewStatus, theme: Theme): string {
@@ -947,11 +1170,6 @@ function firstTextContent(content: readonly { type: string; text?: string }[]): 
 	return "";
 }
 
-function formatDisplayItem(item: SimplifyDisplayItem): string {
-	if (item.type === "tool") return formatToolActivity(item.name, item.args);
-	return `thinking: ${truncateSingleLine(item.text, 100)}`;
-}
-
 function hasActionableSubagentFailure(results: readonly ReviewAgentResult[]): boolean {
 	return results.some((result) => result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted");
 }
@@ -960,67 +1178,99 @@ export default function simplifyExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof SimplifyReviewParamsSchema, SimplifyReviewDetails>({
 		name: "simplify_review",
 		label: "Simplify Review",
-		description: "Run /simplify Phase 1 and Phase 2: identify changed code and stream three parallel review subagents.",
-		promptSnippet: "Run three parallel review subagents for code reuse, code quality, and efficiency before fixing findings.",
+		description:
+			"Run /simplify Phase 1 and Phase 2: identify changed code and stream the configured review council of parallel read-only subagents.",
+		promptSnippet:
+			"Run the configured council of parallel review subagents (default: code reuse, code quality, efficiency) before fixing findings.",
 		promptGuidelines: [
 			"Use simplify_review exactly once when the user invokes /simplify or asks for simplify-style changed-code review.",
 		],
 		parameters: SimplifyReviewParamsSchema,
 		async execute(_toolCallId, params: SimplifyReviewParams, signal, onUpdate, ctx) {
 			const focus = params.focus?.trim() ?? "";
-			const details = createReviewDetails(undefined, focus);
+			const specs = resolveCouncil(ctx);
+			// Resolve thinking per member up front so a bad explicit level fails before the run starts.
+			const thinkingLevels = specs.map((spec) => resolveSpawnThinkingLevel(spec.model ?? ctx.model, params.thinking));
+			const details = createReviewDetails(undefined, focus, specs);
+			const aborts = createLinkedAbortControllers(specs.length, signal);
+			// Publish to the swarm registry so the council shows up in the clone dashboard.
+			let runId = "";
 			const emitNow = () => {
 				onUpdate?.({ content: [{ type: "text", text: summarizeReviewDetails(details) }], details: cloneReviewDetails(details) });
+				updateWorkerRun(runId, toSwarmDetails(details));
 			};
 			const emitter = createThrottledEmitter(emitNow, PROGRESS_EMIT_THROTTLE_MS);
-
-			emitter.flush();
-			const context = await loadChangeContext(pi, ctx, signal);
-			details.phase = "reviewing";
-			details.context = summarizeChangeContext(context);
-			details.updatedAt = Date.now();
-			emitter.flush();
-
-			const thinkingLevel = pi.getThinkingLevel();
-			const results = await Promise.all(
-				REVIEW_AGENT_SPECS.map(async (spec) => {
-					updateAgent(details, spec.id, { status: "running", lastActivity: "starting", output: "", stderr: "" });
-					emitter.flush();
-					const result = await runReviewAgent({
-						ctx,
-						spec,
-						task: buildReviewTask(spec, context, focus),
-						thinkingLevel,
-						signal,
-						onProgress: (patch) => {
-							updateAgent(details, spec.id, patch);
-							emitter.schedule();
-						},
-					});
-					const failed = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-					updateAgent(details, spec.id, {
-						status: failed ? "failed" : "done",
-						lastActivity: failed ? "failed" : "completed",
-						output: result.output,
-						stderr: result.stderr,
-						items: result.items,
-						exitCode: result.exitCode,
-						stopReason: result.stopReason,
-						errorMessage: result.errorMessage,
-					});
-					emitter.flush();
-					return result;
-				}),
-			);
-
-			details.phase = hasActionableSubagentFailure(results) ? "failed" : "done";
-			details.updatedAt = Date.now();
-			emitter.flush();
-
-			return {
-				content: [{ type: "text", text: buildFixPrompt({ context, focus, results }) }],
-				details: cloneReviewDetails(details),
+			const cancel = (agentIndex?: number) => {
+				const indices = agentIndex === undefined ? details.agents.map((_, index) => index) : [agentIndex];
+				for (const index of indices) {
+					const agent = details.agents[index];
+					if (agent?.status === "pending" || agent?.status === "running") {
+						updateAgent(details, agent.id, { lastActivity: "aborting" });
+					}
+				}
+				aborts.abort(agentIndex);
+				emitter.flush();
 			};
+			runId = startWorkerRun("simplify", focus || "review council", toSwarmDetails(details), cancel);
+
+			try {
+				emitter.flush();
+				const context = await loadChangeContext(pi, ctx, signal);
+				details.phase = "reviewing";
+				details.context = summarizeChangeContext(context);
+				details.updatedAt = Date.now();
+				emitter.flush();
+
+				const resourceLoader = await createSubagentLoader(ctx.cwd, SUBAGENT_SYSTEM_PROMPT);
+				const results = await Promise.all(
+					specs.map(async (spec, index) => {
+						updateAgent(details, spec.id, { status: "running", lastActivity: "starting", output: "" });
+						emitter.flush();
+						const result = await runReviewAgent({
+							ctx,
+							spec,
+							task: buildReviewTask(spec, context, focus, specs.length),
+							thinkingLevel: thinkingLevels[index],
+							resourceLoader,
+							signal: aborts.signals[index],
+							onProgress: (patch) => {
+								updateAgent(details, spec.id, patch);
+								emitter.schedule();
+							},
+						});
+						const failed = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+						updateAgent(details, spec.id, {
+							status: failed ? "failed" : "done",
+							lastActivity: failed ? "failed" : "completed",
+							output: result.output,
+							items: result.items,
+							exitCode: result.exitCode,
+							stopReason: result.stopReason,
+							errorMessage: result.errorMessage,
+						});
+						emitter.flush();
+						return result;
+					}),
+				);
+
+				details.phase = hasActionableSubagentFailure(results) ? "failed" : "done";
+				details.updatedAt = Date.now();
+				emitter.flush();
+
+				return {
+					content: [{ type: "text", text: buildFixPrompt({ context, focus, results }) }],
+					details: cloneReviewDetails(details),
+				};
+			} catch (error) {
+				details.phase = "failed";
+				details.updatedAt = Date.now();
+				emitter.flush();
+				throw error;
+			} finally {
+				aborts.dispose();
+				// Always settle the registry run, or the dashboard would show it as live forever.
+				finishWorkerRun(runId, toSwarmDetails(details));
+			}
 		},
 		renderCall(args, theme) {
 			const focus = args.focus?.trim();
@@ -1041,7 +1291,7 @@ export default function simplifyExtension(pi: ExtensionAPI) {
 				if (details.context) text += `\n${theme.fg("muted", formatContextSummary(details.context))}`;
 				for (const agent of details.agents) {
 					const activity = agent.lastActivity ? ` ${theme.fg("dim", truncateSingleLine(agent.lastActivity, 100))}` : "";
-					text += `\n${renderStatus(agent.status, theme)} ${theme.fg("accent", agent.title)}${activity}`;
+					text += `\n${renderStatus(agent.status, theme)} ${theme.fg("accent", agent.title)}${formatAgentAttribution(agent, theme)}${activity}`;
 					for (const item of agent.items.slice(-COLLAPSED_ITEM_COUNT)) {
 						text += `\n  ${theme.fg("muted", formatDisplayItem(item))}`;
 					}
@@ -1059,7 +1309,11 @@ export default function simplifyExtension(pi: ExtensionAPI) {
 			for (const agent of details.agents) {
 				container.addChild(new Spacer(1));
 				container.addChild(
-					new Text(`${renderStatus(agent.status, theme)} ${theme.fg("accent", theme.bold(agent.title))}`, 0, 0),
+					new Text(
+						`${renderStatus(agent.status, theme)} ${theme.fg("accent", theme.bold(agent.title))}${formatAgentAttribution(agent, theme)}`,
+						0,
+						0,
+					),
 				);
 				if (agent.lastActivity) container.addChild(new Text(theme.fg("dim", agent.lastActivity), 0, 0));
 				for (const item of agent.items) {
@@ -1068,9 +1322,6 @@ export default function simplifyExtension(pi: ExtensionAPI) {
 				if (agent.output.trim()) {
 					container.addChild(new Spacer(1));
 					container.addChild(new Markdown(agent.output.trim(), 0, 0, markdownTheme));
-				}
-				if (agent.stderr.trim()) {
-					container.addChild(new Text(theme.fg("error", agent.stderr.trim()), 0, 0));
 				}
 			}
 			return container;
@@ -1081,7 +1332,21 @@ export default function simplifyExtension(pi: ExtensionAPI) {
 		description: SIMPLIFY_COMMAND_DESCRIPTION,
 		handler: async (args, ctx) => {
 			if (!ctx.isIdle()) await ctx.waitForIdle();
+			// First run without saved preferences: ask which model each role uses
+			// (configureCouncil is a no-op outside the TUI).
+			if (!loadCouncilSettings()) await configureCouncil(ctx, undefined);
 			queueInstructionMessage(pi, ctx, buildSimplifyCommandPrompt(args));
+		},
+	});
+
+	pi.registerCommand("simplify-council", {
+		description: "Configure which model each /simplify council role runs on",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("simplify-council requires interactive mode", "error");
+				return;
+			}
+			await configureCouncil(ctx, loadCouncilSettings());
 		},
 	});
 }

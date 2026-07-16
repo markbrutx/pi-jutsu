@@ -33,6 +33,11 @@ interface ContinuationPending {
 	prompt: string;
 }
 
+interface PendingPause {
+	goalId: string;
+	assistant: AssistantMessageLike;
+}
+
 interface AssistantMessageLike {
 	role: "assistant";
 	stopReason?: AgentStopReason;
@@ -77,6 +82,7 @@ let completionStatusTimer: NodeJS.Timeout | undefined;
 let statusTicker: NodeJS.Timeout | undefined;
 let extensionApi: ExtensionAPI | undefined;
 let continuationPending: ContinuationPending | undefined;
+let pendingPause: PendingPause | undefined;
 const cancelledContinuationMarkers = new Set<string>();
 
 const goalCompleteTool = defineTool({
@@ -190,15 +196,22 @@ export default function goal(pi: ExtensionAPI) {
 
 		const goalId = activeGoal.id;
 		const hadPendingContinuation = continuationPending?.goalId === goalId;
+		const wasRecovering = pendingPause?.goalId === goalId;
 		const finalAssistant = findFinalAssistantMessage(event.messages);
 
-		if (!hadPendingContinuation) activeGoal = incrementGoal(activeGoal);
+		if (!hadPendingContinuation && !wasRecovering) activeGoal = incrementGoal(activeGoal);
 		updateGoalUsage(activeGoal, ctx);
 
 		if (finalAssistant?.stopReason === "aborted" || finalAssistant?.stopReason === "error") {
-			pauseGoalAfterAgentEnd(ctx, activeGoal, finalAssistant);
+			// Keep goal mode active while the core retries, falls back, or compacts.
+			// agent_settled applies this pause only if no later successful agent_end
+			// clears the candidate.
+			pendingPause = { goalId, assistant: finalAssistant };
+			persistGoal(activeGoal);
+			updateStatus(ctx, activeGoal);
 			return;
 		}
+		pendingPause = undefined;
 
 		if (activeGoal.tokenBudget !== undefined && activeGoal.tokensUsed >= activeGoal.tokenBudget) {
 			cancelContinuationPending();
@@ -221,6 +234,13 @@ export default function goal(pi: ExtensionAPI) {
 		if (!currentGoal || currentGoal.id !== goalId || currentGoal.status !== "active") return;
 		if (hasPendingMessages(ctx)) return;
 		await sendContinuationPrompt(pi, ctx, currentGoal);
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!activeGoal || activeGoal.status !== "active") return;
+		if (!pendingPause || pendingPause.goalId !== activeGoal.id) return;
+		updateGoalUsage(activeGoal, ctx);
+		pauseGoalAfterSettled(ctx, activeGoal, pendingPause.assistant);
 	});
 }
 
@@ -388,7 +408,7 @@ function incrementGoal(goal: ActiveGoal): ActiveGoal {
 	return { ...goal, iteration: goal.iteration + 1, updatedAt: Date.now() };
 }
 
-function pauseGoalAfterAgentEnd(
+function pauseGoalAfterSettled(
 	ctx: StatusContext,
 	goal: ActiveGoal,
 	assistant: AssistantMessageLike,
@@ -646,12 +666,14 @@ function hasPendingMessages(ctx: StatusContext) {
 
 function clearContinuationTracking() {
 	continuationPending = undefined;
+	pendingPause = undefined;
 	cancelledContinuationMarkers.clear();
 }
 
 function cancelContinuationPending() {
 	if (continuationPending) rememberCancelledContinuationMarker(continuationPending.marker);
 	continuationPending = undefined;
+	pendingPause = undefined;
 }
 
 function rememberCancelledContinuationMarker(marker: string) {
