@@ -4,6 +4,8 @@ Techniques for the pi coding agent.
 
 [pi](https://github.com/earendil-works/pi) is a minimal, extensible coding agent for the terminal. pi-jutsu is a curated collection of extensions for it, built and hardened through daily use. The flagship extension runs Naruto-style shadow-clone agent swarms — hence the name (jutsu: technique).
 
+> **Note:** for the full experience these extensions expect my private `pif` fork of pi (alt-screen fullscreen UIs, per-clone auth accounts, rate-limit fallback events — see [Compatibility](#compatibility)). Most of them still run fine on published pi, just with fewer tricks. If you want the fork — reach out ([@markbrutx](https://github.com/markbrutx) or open an issue) and I'll share access.
+
 ## Extensions
 
 | Extension | What it does |
